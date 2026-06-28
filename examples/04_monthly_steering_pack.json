@@ -1,0 +1,17 @@
+{
+  "_entry_point": "monthly_steering_pack",
+  "_description": "Monthly steering committee pack \u2014 exec audience, risk highlights, budget vs actual, decisions sought.",
+  "engagement_payload": {
+    "engagement_id": "eng-pegasus-q2-26",
+    "client_id": "cli-pegasus-industries",
+    "month": "2026-05",
+    "audience": "steering_committee",
+    "tone": "direct",
+    "budget_consumed_pct": 0.58,
+    "schedule_health": "amber",
+    "decisions_needed": [
+      "Approve scope-add for German market sub-segment (incremental $80K)",
+      "Confirm pause on Spanish-market analysis pending Q3 readiness"
+    ]
+  }
+}

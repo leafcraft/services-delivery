@@ -1,0 +1,33 @@
+{
+  "_entry_point": "draft_client_status",
+  "_description": "Friday end-of-week status report for a multi-stream engagement \u2014 engagement_status_drafter pulls the week's activity, drafts the partner-facing pack.",
+  "engagement_payload": {
+    "engagement_id": "eng-pegasus-q2-26",
+    "client_id": "cli-pegasus-industries",
+    "week_ending": "2026-06-05",
+    "tone": "warm",
+    "audience": "engagement_lead",
+    "streams": [
+      {
+        "name": "Market sizing",
+        "status": "on_track",
+        "completion": 0.6
+      },
+      {
+        "name": "Competitive benchmark",
+        "status": "at_risk",
+        "completion": 0.3,
+        "risk": "key SME interview pushed by 5 days"
+      },
+      {
+        "name": "Regulatory scan",
+        "status": "on_track",
+        "completion": 0.7
+      }
+    ],
+    "open_questions_for_client": [
+      "Confirm 2027 expansion timing assumption",
+      "Confirm preferred entry-mode (greenfield vs M&A)"
+    ]
+  }
+}
