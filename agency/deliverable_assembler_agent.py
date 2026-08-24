@@ -48,8 +48,18 @@ logger = LeafMeshLogger(__name__)
 # Real artifacts land here. gitignored — see ./gitignore (./out/).
 OUT_DIR = Path("./out")
 
-# The engagement lead's approve verdict — the ONLY message that may ship.
+# The engagement lead's approve verdict — the canonical message that ships.
 APPROVE_MESSAGE = "approved_for_client"
+
+# Approval re-check by ALLOWLIST + DENYLIST, so an UNKNOWN / ambiguous verdict
+# FAILS CLOSED (never compiles). Reaching this agent does NOT mean approved.
+_APPROVE_TOKENS = frozenset({
+    "approved_for_client", "approve", "approved", "sign", "signed", "yes", "ok",
+})
+_BLOCK_TOKENS = frozenset({
+    "needs_rework", "hold_for_review", "held_for_review", "held", "hold",
+    "rejected", "reject", "no", "deny", "denied", "escalate",
+})
 
 # Re-used from the QA floor: the lists whose non-emptiness means QA failed.
 _QA_DEFECT_KEYS = ("uncited_claims", "bad_citations", "contradictions", "pii_concerns")
@@ -315,8 +325,25 @@ def compile_deliverable(ctx: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _delete_partial(ctx: dict[str, Any]) -> None:
+    """DELETE-ON-BLOCK — remove any partial artifact for this deliverable so a
+    tripped floor never leaves a half-written file on disk. The floor blocks
+    BEFORE the render, so normally there is nothing to delete; this is the
+    belt-and-braces safeguard the finisher pattern requires."""
+    did = str(ctx.get("deliverable_id") or "").strip()
+    if not did or not OUT_DIR.exists():
+        return
+    try:
+        for p in OUT_DIR.glob(f"*{did}*"):
+            p.unlink(missing_ok=True)
+            logger.warning(f"[assembler] deleted partial artifact {p}")
+    except OSError as e:                          # pragma: no cover
+        logger.warning(f"[assembler] partial-artifact cleanup failed: {e}")
+
+
 def _blocked(reasons: list[str], ctx: dict[str, Any]) -> dict[str, Any]:
     logger.warning(f"[assembler] BLOCKED — {reasons}; no deliverable produced")
+    _delete_partial(ctx)
     return {
         "status": "blocked",
         "blocked": True,
@@ -341,11 +368,17 @@ def gate_and_render(result: dict[str, Any], context: Any) -> dict[str, Any]:
     ctx = result if isinstance(result, dict) else {}
     reasons: list[str] = []
 
-    # FLOOR 1 — lead approval. Anything other than an explicit approve
-    # (needs_rework / hold_for_review / escalate / silence) blocks.
+    # FLOOR 1 — lead approval, by ALLOWLIST + DENYLIST, FAIL CLOSED on unknown.
+    # An explicit block token (needs_rework / hold_for_review / escalate / the
+    # default-deny held_for_review) blocks; anything NOT on the allowlist —
+    # including silence or an unrecognised verdict — also blocks. Only an
+    # explicit approve token ships.
     verdict = ctx.get("lead_verdict", "")
-    if verdict != APPROVE_MESSAGE:
-        reasons.append(f"not lead-approved (verdict='{verdict or '∅'}')")
+    if verdict in _BLOCK_TOKENS:
+        reasons.append(f"lead did not approve (verdict='{verdict or '∅'}')")
+    elif verdict not in _APPROVE_TOKENS:
+        reasons.append(f"no explicit lead approval on record "
+                       f"(verdict='{verdict or '∅'}') — fail closed")
 
     # FLOOR 2 — QA must have passed. A defect (uncited claim, bad citation,
     # contradiction, PII) blocks the compile even if the lead clicked

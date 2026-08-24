@@ -60,15 +60,17 @@ log_level: "INFO"
 # ═══════════════════════════════════════════════════════════════════
 # REDIS — engagement context, deliverable history, citation cache
 # ═══════════════════════════════════════════════════════════════════
-redis:
-  host: "${REDIS_HOST:localhost}"
-  port: ${REDIS_PORT:6379}
-  db: 0
-  password: "${REDIS_PASSWORD:}"
-  auto_storage: true
-  decode_responses: true
-  default_ttl: 86400
-  session_ttl: 2592000             # 30 days — engagement state outlives sessions
+persistence:
+  backend: redis
+  redis:
+    host: "${REDIS_HOST:localhost}"
+    port: ${REDIS_PORT:6379}
+    db: 0
+    password: "${REDIS_PASSWORD:}"
+    auto_storage: true
+    decode_responses: true
+    default_ttl: 86400
+    session_ttl: 2592000             # 30 days — engagement state outlives sessions
 
 # ═══════════════════════════════════════════════════════════════════
 # AUTO-DISCOVER
@@ -82,7 +84,6 @@ auto_discover:
 # MANAGER
 # ═══════════════════════════════════════════════════════════════════
 manager:
-  enabled: true
   model: "gpt-4o-mini"
   domain: "generic"
   can_intervene: true
@@ -201,8 +202,12 @@ data_structures:
 # ═══════════════════════════════════════════════════════════════════
 entry_points:
   - name: "new_engagement"
-    target: "brief_intake_agent"
-    description: "Engagement kickoff — new brief arrives"
+    target: "engagement_coordinator_agent"
+    description: "Engagement kickoff — the coordinator opens the case, then hands it to brief intake"
+
+  - name: "engagement_status"
+    target: "engagement_coordinator_agent"
+    description: "Anyone asks 'where is this engagement?' — the coordinator answers from the case record"
 
   - name: "client_question"
     target: "context_agent"
@@ -337,6 +342,94 @@ entry_points:
 agents:
 
   # ────────────────────────────────────────────────────────────
+  # engagement_coordinator_agent — the COORDINATOR (case owner)
+  # The pod's single point of contact and orchestration hub — like Remi
+  # in the expense-reimbursement reference. It OWNS each engagement from
+  # kickoff to release: it opens the case (hands to brief intake), keeps
+  # live status, RELAYS an IC-edited draft to the engagement lead for the
+  # mandatory review, and escalates to the partner. It never does
+  # specialist work — never researches, drafts, QAs, or approves.
+  #
+  # It is also the seam that keeps humans first-class WITHOUT any
+  # human→human wire: the IC tiers (associate / senior / SME) hand their
+  # edited draft back HERE (dual→chain), and the coordinator routes it on
+  # to the lead / partner (chain→dual). No dual↔dual anywhere.
+  # ────────────────────────────────────────────────────────────
+  engagement_coordinator_agent:
+    name: "engagement_coordinator_agent"
+    agent_type: "llm"
+    description: "Engagement coordinator — opens the case, keeps status, relays edited drafts to the lead, escalates"
+    model: "gpt-4o-mini"
+    temperature: 0.1
+    max_tokens: 800
+    communication_type: "chain"
+
+    prompt: |
+
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+
+      {"action": "", "engagement_id": "", "stage": "", "waiting_on": "", "summary": ""}
+
+      You are the engagement coordinator. You OWN each engagement from the
+      moment it arrives to the moment the deliverable is released. You
+      orchestrate the pod and keep everyone informed — you never research,
+      draft, fact-check, or approve anything yourself.
+
+      Decide "action" from what reached you:
+        - "open_case": a NEW brief arrived (no human verdict in the input).
+          Open the case and hand it to brief intake.
+        - "route_to_lead": an IC (associate / senior / SME) finished their
+          editing pass and handed the draft back (their reply is present as
+          human_message, e.g. "approved_for_lead"). Route it to the
+          engagement lead for the mandatory pre-client review.
+        - "escalate": an IC or the lead asked to escalate (human_message is
+          "escalate", "escalate_to_lead", or "escalate_to_partner"). Route
+          to the partner.
+        - "status": someone asked where the engagement stands. Answer
+          "stage" / "waiting_on" from the case record — invent nothing.
+
+      Set "engagement_id" from the input (echo verbatim if present; else "").
+      "stage" is the current step; "waiting_on" is who owes the next move;
+      "summary" is one sentence a human can read. Silence never advances an
+      engagement — when in doubt, choose "status" and say what is missing.
+
+    enforce_yields: true
+    enforce_yields_retry: 2
+
+    yields:
+      action: "string"              # open_case | route_to_lead | escalate | status
+      engagement_id: "string"
+      stage: "string"
+      waiting_on: "string"
+      summary: "string"
+
+    inputs:
+      brief_payload: "object"
+      engagement_id: "string"
+
+    can_call:
+      # New brief → normalize it. chain→chain.
+      - agent: "brief_intake_agent"
+        condition: "calling_agent_response.action == 'open_case'"
+
+      # IC handed the edited draft back → the lead's mandatory review.
+      # chain→dual (no warning); the lead is the ONLY gate before the finisher.
+      - agent: "engagement_lead_human"
+        condition: "calling_agent_response.action == 'route_to_lead'"
+
+      # Escalation → partner. chain→dual.
+      - agent: "partner_human"
+        condition: "calling_agent_response.action == 'escalate'"
+
+      # A status answer (or anything else) is recorded to the WORM sink.
+      - agent: "delivery_audit_logger_agent"
+        condition: "calling_agent_response.action == 'status'"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ────────────────────────────────────────────────────────────
   # brief_intake_agent — normalizes inbound briefs
   # ────────────────────────────────────────────────────────────
   brief_intake_agent:
@@ -460,7 +553,19 @@ agents:
     model: "gpt-4o-mini"
     temperature: 0.1
     max_tokens: 1500
-    communication_type: "dual"          # bidirectional — context can call research
+    # AI specialist → chain (NOT dual). `dual` belongs only on the human/webhook
+    # boundary agents; a dual→dual can_call auto-bounces replies independent of
+    # conditions (nuances-and-gotchas #17). research↔context is still peer-to-peer
+    # below — chain can_call is conditional and bounded, with no ping-pong.
+    communication_type: "chain"
+    max_tool_calls_per_message: 12      # a research pass pulls many sources; default 5 truncates silently
+
+    # Super-Agent (research → analysis synthesis) — the canonical multi-step case:
+    # plan → pull sources → verify → synthesise. DICT form is the ONLY tuning path
+    # (2.4.123+); never flat super_agent_* keys.
+    super_agent:
+      cost_ceiling: 100000
+      wall_clock: 900
 
     prompt: |
 
@@ -535,9 +640,55 @@ agents:
       direct research→lead edge: research fans IN to the consultant, it
       does not branch to a human mid-pass.)
 
+    # Playbook — the CRAFT, fetched on demand. Only `description` rides in the
+    # prompt's skills index; `responsibility` is loaded when the model
+    # recognises the intent (per-agent registry — REQUIRES leafmesh>=2.4.130).
+    playbook:
+      - intent: prior_art_search
+        description: "How to pull and rank prior art before writing a single finding."
+        responsibility: |
+          1. Pull the corpus FIRST (past projects, industry reports,
+             methodology) biased to the brief's practice area — you cannot
+             ground a finding you have not retrieved.
+          2. Rank sources by relevance to the scope_summary, then recency.
+          3. Every finding must carry a source_id drawn from the resolvable
+             set. A finding with no retrievable source is DROPPED, never
+             softened into prose — citation-or-nothing.
+        variables: [engagement_id, practice_area]
+      - intent: gap_flagging
+        description: "How to decide a sub-topic is a knowledge gap, not a weak guess."
+        responsibility: |
+          1. If no source in the corpus supports a sub-topic the brief needs,
+             add it to knowledge_gaps — that is the signal to ingest, not a
+             cue to fabricate.
+          2. Never lower a finding's confidence to sneak an unsupported claim
+             through; drop it and record the gap instead.
+        variables: [engagement_id]
+
+    # Day-0 tool surface — reads the seed research corpus so the pod runs with
+    # NO KB/RAG connector wired. Each tool announces itself (available:false)
+    # when it has no real source — never a synthetic empty-but-confident hit.
+    # See agency/tools.py.
+    tools: [search_prior_art, list_resolvable_sources]
+    tool_categories: [research]
+
+    # ── To wire your real KB / RAG, uncomment and set the URL (each named
+    #    action under `use:` becomes its own namespaced tool, e.g.
+    #    kb_semantic_search). NOTE: the SDK REJECTS an http mcp block with an
+    #    EMPTY url at load, so this ships COMMENTED — fill the URL, then
+    #    uncomment. Do NOT also list these under `tools:` (they merge in). ──
+    # mcp:
+    #   - transport: http
+    #     url: "${KB_MCP_URL}"
+    #     token: "${KB_MCP_TOKEN:}"
+    #     use: [semantic_search, read_document]
+    #     name: kb
+    #     timeout: 30
+
     can_call:
       # Peer-to-peer with context — research can ask context for
-      # client-specific history when it finds an interesting pattern
+      # client-specific history when it finds an interesting pattern.
+      # chain→chain (not dual↔dual): conditional, no auto-bounce.
       - agent: "context_agent"
         condition: "calling_agent_response.confidence >= 0.5"
 
@@ -556,7 +707,10 @@ agents:
     model: "gpt-4o-mini"
     temperature: 0.1
     max_tokens: 1500
-    communication_type: "dual"
+    # AI specialist → chain (NOT dual). See research_agent's note: dual↔dual
+    # auto-bounces (gotcha #17). The peer-to-peer context↔research edge below is
+    # chain, conditional, and bounded by context_retry_exhausted (loop guard).
+    communication_type: "chain"
 
     prompt: |
 
@@ -648,6 +802,14 @@ agents:
     thinking_budget: 8192
     reasoning: true
     enable_prompt_caching: true
+
+    # Skills — the firm's HOUSE STYLE, loaded on demand (shortform normalises to
+    # the default source). The prompt holds identity + output contract; the
+    # deliverable voice / structure conventions live in the skill so they can be
+    # tuned without touching the prompt. Register a filesystem/hosted skills
+    # source (POST /api/skills/sources) to serve the bodies; until then the
+    # index advertises them and the model falls back to the prompt's structure.
+    skills: ["house_style_deliverables", "citation_discipline"]
 
     # Fan-in: requires context (always); research optional (?-marked)
     wait_for: "context_agent AND research_agent?"
@@ -746,6 +908,28 @@ agents:
       serviceName: "mongo_main"
       enabled: true
       groupName: "methodology"
+
+    # Playbook — per-deliverable-type craft, fetched on demand. Only the
+    # `description` is advertised; `responsibility` loads when the model picks
+    # the intent (per-agent registry — REQUIRES leafmesh>=2.4.130).
+    playbook:
+      - intent: build_memo
+        description: "How to structure a board-ready memo and where the recommendation goes."
+        responsibility: |
+          1. Lead with the go/no-go recommendation and its single strongest
+             piece of cited evidence — the board reads slide 1, not the appendix.
+          2. TL;DR → context → analysis → recommendation → next steps.
+          3. Every factual claim carries a [cite: source_id] tag drawn from the
+             research corpus; an unsupported claim is rephrased or dropped.
+        variables: [engagement_id, deliverable_type]
+      - intent: build_recommendation
+        description: "How to write a recommendation deliverable a partner can defend."
+        responsibility: |
+          1. State the ask in one sentence, then 3 reasons, then the risks,
+             then next steps.
+          2. If the hypothesis lacks supporting evidence, cap confidence and
+             flag requires_sme_review — an evidence-free recommendation is poison.
+        variables: [engagement_id]
 
     yields:
       hypothesis: "string"
@@ -992,31 +1176,77 @@ agents:
   # ────────────────────────────────────────────────────────────
   status_sweep_orchestrator_agent:
     name: "status_sweep_orchestrator_agent"
-    agent_type: "programmatic"
-    description: "Weekly status sweep across active engagements (from YOUR PSA/project tracker via n8n); surfaces blocked / overdue"
-    communication_type: "execute"
-    integration: "n8n"
-    connector_config:
-      # n8n workflow that queries your PSA / project tracker and
-      # returns {engagements_swept, blocked_engagements,
-      # overdue_engagements, report_url}. Env fallback: N8N_WEBHOOK_URL.
-      webhook_url: "${PSA_STATUS_SWEEP_WEBHOOK_URL:}"
-      auth_token: "${PSA_STATUS_SWEEP_AUTH_TOKEN:}"
-      timeout: 60
-    # wake_up: "0 9 * * 1"             # Mondays 09:00 — enable after wiring your PSA/project-tracker connector
+    agent_type: "llm"
+    description: "Weekly status sweep — parallel instances each claim one active engagement and report its position"
+    model: "gpt-4o-mini"
+    temperature: 0.1
+    communication_type: "chain"
+    max_tool_calls_per_message: 8
 
-    # Connector-returned fields ARE the yields (lenient fill) — any
-    # outbound condition on them would be valid.
+    # ── PARALLEL INSTANCES (2.4.118+) — backlog fan-out ──────────────────────
+    # ONE weekly trigger fans out into N copies IN THE SAME SESSION. Each copy
+    # CLAIMS one active engagement from the shared backlog via the ATOMIC claim
+    # tool below, so the copies SPLIT the backlog instead of duplicating work
+    # (the merge would honestly show duplicates otherwise). instances_handoff:
+    # last COMBINES the copies deterministically — lists concatenate, numbers
+    # sum (each copy sweeps 1 → the total is the count claimed) — and routes ONCE.
+    instances: 3
+    instances_handoff: last
+
+    # LIVE wake — Mondays 09:00 in the FIRM's timezone. Without `timezone` a
+    # cron runs in UTC (09:00 UTC != 09:00 local). Runs day-0 against the seed
+    # backlog; PROD swaps the claim tool's body for your PSA/project tracker.
+    wake_up: "0 9 * * 1"
+    timezone: "America/New_York"
+    wake_up_input:
+      trigger: weekly_sync
+
+    # Atomic claim tool — one disjoint engagement per copy. See agency/tools.py.
+    tools: [claim_next_active_engagement]
+    tool_categories: [delivery_ops]
+
+    prompt: |
+
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+
+      {"engagements_swept": 0, "status_lines": [], "blocked_engagements": [], "overdue_engagements": []}
+
+      You are ONE worker in a parallel weekly status sweep. FIRST call
+      claim_next_active_engagement to atomically claim ONE engagement from the
+      shared backlog — the atomic claim guarantees no two workers take the same
+      engagement, so you never duplicate another worker's report.
+
+      If the claim returns available:false (the backlog is empty), return
+      engagements_swept 0 with empty lists — never invent an engagement.
+
+      If you claimed one, report ONLY its position:
+        - engagements_swept: 1
+        - status_lines: a single {engagement_id, stage, one_line} object in a list
+        - blocked_engagements: [{engagement_id, blocker}] if it is blocked, else []
+        - overdue_engagements: [{engagement_id, days_overdue}] if past deadline, else []
+
+      Never report on an engagement you did not claim.
+
+    enforce_yields: true
+
     yields:
-      engagements_swept: "number"
+      engagements_swept: "number"        # summed across copies = engagements claimed
+      status_lines: "list"               # concatenated across copies
       blocked_engagements: "list"
       overdue_engagements: "list"
-      report_url: "string"
 
     inputs:
       trigger: "string"
 
-    can_call: []                          # terminal — the n8n workflow posts the report to your channel
+    can_call:
+      # Anything blocked / overdue → the lead sees the combined sweep.
+      - agent: "engagement_lead_human"
+        condition: "calling_agent_response.blocked_engagements != [] or calling_agent_response.overdue_engagements != []"
+
+      # Clean sweep → recorded to the WORM audit.
+      - agent: "delivery_audit_logger_agent"
+        condition: "calling_agent_response.blocked_engagements == [] and calling_agent_response.overdue_engagements == []"
 
   # ────────────────────────────────────────────────────────────
   # associate_human — Tier-1 IC
@@ -1024,24 +1254,25 @@ agents:
   associate_human:
     name: "associate_human"
     agent_type: "human"
-    is_human_powered: true
     description: "Associate / IC — handles the editing + personalisation on routine deliverables"
-    human_interface: "default"
-    communication_type: "dual"
+    human_interface: "webhook"
+    communication_type: "dual"           # dual belongs on the human/webhook boundary
     human_timeout_seconds: 14400         # 4 hours
-
-    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
-    #   gate to the SHARED inbox. Only set real operator emails: a
-    #   placeholder assigns tasks to a nonexistent operator and they
-    #   never appear in anyone's inbox.
+    # DEFAULT-DENY on silence: an unanswered edit becomes held_for_review and is
+    # recorded to the WORM sink — the deliverable never advances unattended.
     fallback_on_timeout: true
     fallback_response:
-      decision: "escalate"
-      message: "escalate"
-      note: "Associate didn't respond — escalating to senior consultant"
+      human_decision: "held"
+      human_message: "held_for_review"
+    webhook_config:
+      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
+      outbound_headers: {Content-Type: "application/json"}
+      outbound_timeout: 30
+      max_retries: 1
+      retry_delay: 2
 
     yields:
-      decision: "string"                 # approved_for_lead | needs_more_research | escalate
+      human_message: "string"            # approved_for_lead | needs_more_research | escalate | held_for_review
       notes: "string"
 
     inputs:
@@ -1055,14 +1286,19 @@ agents:
       with a specific ask.
 
     can_call:
-      - agent: "engagement_lead_human"
-        condition: "calling_agent_response.human_message == 'approved_for_lead'"
-
-      - agent: "senior_consultant_human"
-        condition: "calling_agent_response.human_message == 'escalate'"
-
+      # Kick back for more research — human→chain (research_agent), a bounded
+      # back-edge. NOT a human→human wire.
       - agent: "research_agent"
         condition: "calling_agent_response.human_message == 'needs_more_research'"
+
+      # Edited draft ready, or escalate → hand back to the COORDINATOR (chain),
+      # which relays to the lead / partner. No human→human edge.
+      - agent: "engagement_coordinator_agent"
+        condition: "calling_agent_response.human_message == 'approved_for_lead' or calling_agent_response.human_message == 'escalate'"
+
+      # Default-deny terminus.
+      - agent: "delivery_audit_logger_agent"
+        condition: "calling_agent_response.human_message == 'held_for_review'"
 
   # ────────────────────────────────────────────────────────────
   # senior_consultant_human — Tier-2
@@ -1070,31 +1306,35 @@ agents:
   senior_consultant_human:
     name: "senior_consultant_human"
     agent_type: "human"
-    is_human_powered: true
     description: "Senior consultant — strategic accounts, recommendation deliverables"
-    human_interface: "default"
+    human_interface: "webhook"
     communication_type: "dual"
     human_timeout_seconds: 21600         # 6 hours
-
-    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
-    #   gate to the SHARED inbox. Only set real operator emails: a
-    #   placeholder assigns tasks to a nonexistent operator and they
-    #   never appear in anyone's inbox.
     fallback_on_timeout: true
     fallback_response:
-      decision: "escalate_to_lead"
-      message: "escalate_to_lead"
-      note: "Senior consultant didn't respond — engagement lead takes the edit pass"
+      human_decision: "held"
+      human_message: "held_for_review"
+    webhook_config:
+      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
+      outbound_headers: {Content-Type: "application/json"}
+      outbound_timeout: 30
 
     yields:
-      decision: "string"
+      human_message: "string"            # approved_for_lead | escalate_to_lead | escalate | held_for_review
       notes: "string"
 
     inputs:
       deliverable_id: "string"
 
     can_call:
-      - agent: "engagement_lead_human"
+      # Edited draft or escalation → the coordinator relays to the lead.
+      # human(dual)→coordinator(chain): no human→human wire.
+      - agent: "engagement_coordinator_agent"
+        condition: "calling_agent_response.human_message == 'approved_for_lead' or calling_agent_response.human_message == 'escalate_to_lead' or calling_agent_response.human_message == 'escalate'"
+
+      # Default-deny terminus.
+      - agent: "delivery_audit_logger_agent"
+        condition: "calling_agent_response.human_message == 'held_for_review'"
 
   # ────────────────────────────────────────────────────────────
   # sme_human — domain SME
@@ -1102,24 +1342,21 @@ agents:
   sme_human:
     name: "sme_human"
     agent_type: "human"
-    is_human_powered: true
     description: "Domain SME — depth-of-expertise on the practice area"
-    human_interface: "default"
+    human_interface: "webhook"
     communication_type: "dual"
     human_timeout_seconds: 28800         # 8 hours
-
-    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
-    #   gate to the SHARED inbox. Only set real operator emails: a
-    #   placeholder assigns tasks to a nonexistent operator and they
-    #   never appear in anyone's inbox.
     fallback_on_timeout: true
     fallback_response:
-      decision: "escalate_to_partner"
-      message: "escalate_to_partner"
-      note: "SME didn't respond — partner escalation"
+      human_decision: "held"
+      human_message: "held_for_review"
+    webhook_config:
+      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
+      outbound_headers: {Content-Type: "application/json"}
+      outbound_timeout: 30
 
     yields:
-      decision: "string"
+      human_message: "string"            # approved_for_lead | escalate_to_lead | escalate_to_partner | held_for_review
       notes: "string"
 
     inputs:
@@ -1127,11 +1364,14 @@ agents:
       practice_area: "string"
 
     can_call:
-      - agent: "engagement_lead_human"
-        condition: "calling_agent_response.human_message != 'escalate_to_partner'"
+      # Reviewed / escalated → the coordinator relays to lead or partner.
+      # human(dual)→coordinator(chain): no human→human wire.
+      - agent: "engagement_coordinator_agent"
+        condition: "calling_agent_response.human_message == 'approved_for_lead' or calling_agent_response.human_message == 'escalate_to_lead' or calling_agent_response.human_message == 'escalate_to_partner'"
 
-      - agent: "partner_human"
-        condition: "calling_agent_response.human_message == 'escalate_to_partner'"
+      # Default-deny terminus.
+      - agent: "delivery_audit_logger_agent"
+        condition: "calling_agent_response.human_message == 'held_for_review'"
 
   # ────────────────────────────────────────────────────────────
   # engagement_lead_human — PM + relationship owner (ALWAYS in loop)
@@ -1139,24 +1379,23 @@ agents:
   engagement_lead_human:
     name: "engagement_lead_human"
     agent_type: "human"
-    is_human_powered: true
     description: "Engagement lead / PM — owns the relationship; ALWAYS reviews before client sees output"
-    human_interface: "default"
+    human_interface: "webhook"
     communication_type: "dual"
     human_timeout_seconds: 21600         # 6 hours
-
-    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
-    #   gate to the SHARED inbox. Only set real operator emails: a
-    #   placeholder assigns tasks to a nonexistent operator and they
-    #   never appear in anyone's inbox.
+    # DEFAULT-DENY: an unanswered final review holds the deliverable for manual
+    # review and records it — silence never ships a deliverable to a client.
     fallback_on_timeout: true
     fallback_response:
-      decision: "hold_for_review"
-      message: "hold_for_review"
-      note: "Engagement lead didn't respond — deliverable paused for manual review (default-deny)"
+      human_decision: "held"
+      human_message: "held_for_review"
+    webhook_config:
+      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
+      outbound_headers: {Content-Type: "application/json"}
+      outbound_timeout: 30
 
     yields:
-      decision: "string"                 # approved_for_client | needs_rework | escalate
+      human_message: "string"            # approved_for_client | needs_rework | hold_for_review | escalate | held_for_review
       notes: "string"
 
     inputs:
@@ -1168,20 +1407,22 @@ agents:
       reputation matters more than throughput.
 
     can_call:
-      # ── APPROVE → the deliverable_assembler COMPILES the real client
-      #    deliverable (the team FINISHES the job), then audits. The
-      #    assembler's @chain floor re-checks approval + QA and fails
-      #    closed, so a stale/forged approve can never ship a defect.
+      # ── APPROVE → the deliverable_assembler (FINISHER) COMPILES the real
+      #    client deliverable, then audits. The assembler's @chain floor
+      #    re-checks approval (allow/deny tokens, fail closed on unknown) + QA
+      #    and DELETES any partial on a block — a stale/forged approve can
+      #    never ship a defect. chain target, not human.
       - agent: "deliverable_assembler_agent"
         condition: "calling_agent_response.human_message == 'approved_for_client'"
 
-      # Not-approved verdicts (rework / hold) terminate straight to audit —
-      # nothing is compiled.
-      - agent: "delivery_audit_logger_agent"
-        condition: "calling_agent_response.human_message == 'needs_rework' or calling_agent_response.human_message == 'hold_for_review'"
-
-      - agent: "partner_human"
+      # Escalate → the coordinator routes to the partner (no human→human wire).
+      - agent: "engagement_coordinator_agent"
         condition: "calling_agent_response.human_message == 'escalate'"
+
+      # Not-approved verdicts (rework / hold / default-deny) terminate straight
+      # to the WORM audit — nothing is compiled.
+      - agent: "delivery_audit_logger_agent"
+        condition: "calling_agent_response.human_message == 'needs_rework' or calling_agent_response.human_message == 'hold_for_review' or calling_agent_response.human_message == 'held_for_review'"
 
   # ────────────────────────────────────────────────────────────
   # partner_human — escalation tier
@@ -1189,24 +1430,22 @@ agents:
   partner_human:
     name: "partner_human"
     agent_type: "human"
-    is_human_powered: true
     description: "Partner — exec sponsor, escalation tier"
-    human_interface: "default"
+    human_interface: "webhook"
     communication_type: "dual"
     human_timeout_seconds: 43200         # 12 hours
-
-    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
-    #   gate to the SHARED inbox. Only set real operator emails: a
-    #   placeholder assigns tasks to a nonexistent operator and they
-    #   never appear in anyone's inbox.
+    # DEFAULT-DENY: an unreachable partner holds the engagement and records it.
     fallback_on_timeout: true
     fallback_response:
-      decision: "halt_for_review"
-      message: "halt_for_review"
-      note: "Partner unavailable — engagement paused for personal review (default-deny)"
+      human_decision: "held"
+      human_message: "held_for_review"
+    webhook_config:
+      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
+      outbound_headers: {Content-Type: "application/json"}
+      outbound_timeout: 30
 
     yields:
-      decision: "string"
+      human_message: "string"            # directive_issued | halt_for_review | held_for_review
       directive: "string"
 
     inputs:
@@ -1214,7 +1453,11 @@ agents:
       escalation_reason: "string"
 
     can_call:
+      # The partner is the escalation terminus — every directive (and every
+      # default-deny hold) lands in the WORM audit. Conditional on the uniform
+      # human reply shape.
       - agent: "delivery_audit_logger_agent"
+        condition: "calling_agent_response.human_message != ''"
 
   # ────────────────────────────────────────────────────────────
   # deliverable_assembler_agent — the real artifact-producing executor
@@ -1302,7 +1545,12 @@ agents:
     temperature: 0.2
     max_completion_tokens: 2000
     communication_type: "chain"
-    wake_up: "0 14 * * 5"               # Friday 14:00 — drafts before EOD
+    # LIVE wake — Friday 14:00 in the FIRM's timezone (NOT UTC; without
+    # `timezone` "0 14 * * 5" fires at 14:00 UTC, not local).
+    wake_up: "0 14 * * 5"
+    timezone: "America/New_York"
+    # House voice for the client-facing status note — loaded on demand.
+    skills: ["house_style_deliverables"]
 
     prompt: |
 

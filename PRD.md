@@ -17,7 +17,10 @@ The client is never a mesh member; Priya owns all client contact.
 ## ASCII flow
 
 ```
-new_engagement ─► brief_intake_agent (llm)
+new_engagement / engagement_status ─► engagement_coordinator_agent (llm, case owner)
+                       │  (opens case → brief intake; relays edits → lead; escalates → partner)
+                       ▼
+                 brief_intake_agent (llm)
                        │
         ┌──────────────┼──────────────────────────┐
         │ (always)     │             (if requires_research)
@@ -39,7 +42,14 @@ manual_action  ──────────────►       analyse AND d
   citation_agent  engagement_   partner_human   [tier matrix]  (PII → partner)
   (programmatic)  lead_human    (if PII)         sme/senior/associate_human
         │         (ALWAYS)          │                  │
-        │              │            │                  │
+        │              │            │      (edited draft) │
+        │              │            │                  ▼
+        │              │            │      engagement_coordinator_agent
+        │              │            │            (relay → lead; no human→human)
+        │              ▼            │                  │
+        │   approved_for_client ─► deliverable_assembler_agent (FINISHER)
+        │              │            │   re-check approve (allow/deny, fail-closed)
+        │              │            │   + QA → render ./out/*.md|pdf | delete-on-block
         └──────────────┴────────────┴──────────────────┘
                        ▼  (every terminal path)
               delivery_audit_logger_agent  (hash-chained WORM)
@@ -49,7 +59,9 @@ log_time_entry / scope_creep_check ─► timesheet_connector_agent (n8n/PSA)
                                             ├─► engagement_lead_human (action)
                                             └─► delivery_audit_logger_agent (clean)
 
-weekly_sync (cron) ─► status_sweep_orchestrator_agent (n8n/PSA, terminal)
+weekly_sync (cron, tz) ─► status_sweep_orchestrator_agent (instances:3, atomic claim)
+                          ├─► engagement_lead_human (blocked/overdue)
+                          └─► delivery_audit_logger_agent (clean)
 draft_client_status / daily_standup_brief / monthly_steering_pack
                    ─► engagement_status_drafter_agent ─► engagement_lead_human
 draft_consultant_review ─► performance_review_agent ─► partner / lead
@@ -61,15 +73,17 @@ escalation_received ─► partner_human (direct)
 
 | Agent | Job title | Type |
 |---|---|---|
+| `engagement_coordinator_agent` | Engagement coordinator (case owner) | llm (POD coordinator; opens/status/relays/escalates) |
 | `brief_intake_agent` | Intake coordinator | llm |
-| `research_agent` | Research analyst | llm (KB: industry_reports) |
+| `research_agent` | Research analyst | llm **Super-Agent** (dev-store tools + playbook; KB: industry_reports) |
 | `context_agent` | Client account researcher | llm (KB: client_context) + loop-guard micro |
-| `consultant_agent` | Engagement consultant | llm (Claude + thinking; KB: methodology) |
+| `consultant_agent` | Engagement consultant | llm (Claude + thinking; **house-style skills** + playbook; KB: methodology) |
 | `qa_agent` | Quality reviewer | llm + pre-gate stash micro |
 | `citation_agent` | Citations checker | programmatic (Python control) |
+| `deliverable_assembler_agent` | Deliverable assembler (finisher) | programmatic (fail-closed render to ./out) |
 | `engagement_controller_agent` | Engagement controller | llm (KB: engagement_sow_library) |
 | `timesheet_connector_agent` | Timesheet/PSA liaison | programmatic (n8n) |
-| `status_sweep_orchestrator_agent` | Delivery PMO coordinator | programmatic (n8n) |
+| `status_sweep_orchestrator_agent` | Delivery PMO coordinator | llm (`instances:3` + atomic claim; live cron+tz) |
 | `engagement_status_drafter_agent` | Client communications drafter | llm (cron; KB: client_context) |
 | `performance_review_agent` | People-ops review drafter | llm (KB: consultant_review_rubric) |
 | `doc_extraction_agent` | Knowledge manager | llm (KB: kb_taxonomy) |
@@ -156,24 +170,37 @@ ad-hoc/debug invocation.
 - **Confidence gates** — `< 0.7` ⇒ SME; evidence-free hypothesis ⇒ SME.
 - **Bounded peer loop** — research↔context capped at one bounce/session.
 - **WORM audit** — every terminal path lands in the hash-chained sink.
-- **HITL fallback chain** — associate → senior → lead → partner → halt,
-  all default-deny.
+- **Finisher, fail-closed** — `deliverable_assembler_agent` re-checks lead
+  approval by allow/deny token (fail-closed on unknown) + QA, renders the
+  real document, deletes any partial on a block.
+- **No human→human wire** — humans are first-class but never call each
+  other; the IC tiers hand back to `engagement_coordinator_agent` (dual→chain),
+  which routes on (chain→dual); `dual` lives only on the human boundary.
+- **HITL default-deny** — every gate `fallback_on_timeout` → `held_for_review`
+  → the WORM sink; the Manager supervisor carries human→human escalation.
 
 ## Config pointer
 
 The department is `configs/config.yaml`. State of record lives in your
 systems: hours in the PSA/timesheet system behind
-`timesheet_connector_agent`, the engagement sweep in your project tracker
-behind `status_sweep_orchestrator_agent` (both n8n; crons commented until
-wired). The full chain runs day-0 on Tier 1 alone against a seeded dev
-store (`agency/_shared/store.py`) — a brief, research corpus, account
-context and prior deliverables for one realistic engagement; in prod each
-store call becomes a connector call (the signatures are the contract).
-Five Python modules carry the depth — `citation_agent` (control),
+`timesheet_connector_agent` (n8n; cron commented until wired). The weekly
+sweep (`status_sweep_orchestrator_agent`) runs day-0 on its live cron —
+`instances:3` copies each atomically claim one engagement from the seed
+backlog via `agency/tools.py`; wiring tier 3 swaps the claim tool's body
+for your PSA query. The full chain runs day-0 on Tier 1 alone against a
+seeded dev store (`agency/_shared/store.py`) — a brief, research corpus,
+account context and prior deliverables for one realistic engagement; in
+prod each store call becomes a connector call (the signatures are the
+contract). Agents that PULL in-turn do so through day-0 dev-store tools
+(`agency/tools.py`), each announcing `available:false` when it has no
+real source.
+The Python modules carry the depth — `citation_agent` (control),
 `context_agent` (loop guard), `consultant_agent` (`@pre_compose` +
-`@compose` + floors), `qa_agent` (`@pre_compose` + `@chain` floors) and
-`engagement_status_drafter_agent` (`@pre_compose`) — each a thing YAML
-can't express; every other floor is a prompt contract + `enforce_yields`.
+`@compose` + floors), `qa_agent` (`@pre_compose` + `@chain` floors),
+`engagement_status_drafter_agent` (`@pre_compose`), and the
+`deliverable_assembler_agent` **finisher** (`@pre_compose` recovery +
+`@chain` fail-closed render) — each a thing YAML can't express; every
+other floor is a prompt contract + `enforce_yields`.
 
 ## Reflection / decisions
 

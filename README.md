@@ -69,7 +69,12 @@ sensitivities) and a prior deliverable. Self-reliant agents pull this
 context **themselves** via `@pre_compose` — the consultant pulls the
 brief + corpus + account + priors; QA pulls the engagement record it
 verifies citations against; the status drafter pulls the engagement
-record. Nothing is spoon-fed by a conductor.
+record. Nothing is spoon-fed by a conductor. Agents that PULL in-turn do
+so through day-0 dev-store **tools** (`agency/tools.py`) — `search_prior_art`
+/ `list_resolvable_sources` for research, `claim_next_active_engagement`
+for the parallel sweep — and every tool **announces itself**
+(`available: false` with a reason) when it has no real source, never a
+synthetic empty-but-confident hit.
 
 Copy-paste demo (after Quick start, with the mesh running you can call an
 entry point directly):
@@ -108,13 +113,14 @@ alone; tiers 2–3 light up host prerequisites and external systems.
 | Var | Purpose |
 |---|---|
 | `LEAFMESH_LICENSE_KEY` | Required — the SDK refuses to start without it |
-| `OPENAI_API_KEY` | `gpt-4o-mini` agents (intake, research, context, qa, controller, doc-extraction, manager) |
+| `OPENAI_API_KEY` | `gpt-4o-mini` agents (coordinator, intake, research, context, qa, controller, status-sweep, doc-extraction, manager) |
 | `ANTHROPIC_API_KEY` | `claude-sonnet-4-6` agents (consultant, status drafter, performance review) |
 
 ### Tier 2 — host prerequisites & adapters (recommended)
 | Var | Purpose |
 |---|---|
 | `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` | Engagement context, deliverable history, session store (30-day TTL). Defaults to `localhost:6379` |
+| `HITL_OUTBOUND_URL` | Webhook the human members notify (inbox / Studio adapter). Defaults to `http://127.0.0.1:9999/human-notify` |
 | `PAGER_WEBHOOK` | Escalation webhook target (defaults to a PagerDuty Events v2 URL) |
 | `LEAFMESH_ENV_TOKEN` | Host/SDK environment token |
 
@@ -122,13 +128,21 @@ alone; tiers 2–3 light up host prerequisites and external systems.
 | Var | Purpose |
 |---|---|
 | `PSA_TIMESHEET_WEBHOOK_URL` / `PSA_TIMESHEET_AUTH_TOKEN` | n8n workflow fronting your PSA/timesheet system (Harvest, Toggl, ClickTime, Tempo, Kantata) — hours + budget position |
-| `PSA_STATUS_SWEEP_WEBHOOK_URL` / `PSA_STATUS_SWEEP_AUTH_TOKEN` | n8n workflow fronting your PSA/project tracker (Kantata, Asana, Jira, Monday) — active-engagement sweep |
+| `PSA_STATUS_SWEEP_WEBHOOK_URL` / `PSA_STATUS_SWEEP_AUTH_TOKEN` | n8n workflow fronting your PSA/project tracker (Kantata, Asana, Jira, Monday) — active-engagement sweep (the sweep runs day-0 on the seed backlog until wired) |
+| `KB_MCP_URL` / `KB_MCP_TOKEN` | Your KB / RAG for `research_agent`; set it, then uncomment the `mcp:` block in `configs/config.yaml` |
 | `SLACK_DELIVERY_CHANNEL` | `channel_id` the escalation `channel` target posts to |
 | `SLACK_BOT_TOKEN` / `SLACK_SIGNING_SECRET` | Fields of a `channels: {slack: {...}}` block (ChannelConfig) — **not** auto-consumed by the escalation channel target. Add a `channels:` block to `configs/config.yaml` to actually deliver Slack messages |
 
-After wiring tier 3, un-comment the `# wake_up:` crons on
-`timesheet_connector_agent` and `status_sweep_orchestrator_agent` in
-`configs/config.yaml`.
+The `status_sweep_orchestrator_agent` sweep runs **day-0** on its live
+Monday cron against the seed backlog (via the `claim_next_active_engagement`
+dev-store tool); wiring tier 3 only swaps that tool's body for your PSA
+query. After wiring tier 3, un-comment the `# wake_up:` cron on
+`timesheet_connector_agent` in `configs/config.yaml`, and uncomment the
+`# mcp:` block on `research_agent` once you set `KB_MCP_URL`.
+
+> **HITL delivery:** the human members use `human_interface: webhook`
+> (`HITL_OUTBOUND_URL`, default `http://127.0.0.1:9999/human-notify`) —
+> point it at your inbox/Studio adapter to actually reach people.
 
 ## Agents
 
@@ -138,33 +152,37 @@ lead owns all client contact.
 
 | Agent | Role | Responsibilities | Can perform |
 |---|---|---|---|
-| `brief_intake_agent` | Intake coordinator | Normalises any inbound ask (email, Slack, SOW, meeting note) into a canonical `EngagementBrief`; enforces the strategic-account → research policy floor | → `context_agent` (always), → `research_agent` (if research required) |
-| `research_agent` | Research analyst | Pulls prior art, industry reports, methodology from the `industry_reports` KB; citation-or-nothing; flags `knowledge_gaps` for ingestion | ↔ `context_agent` (peer cross-reference); fans in to consultant |
-| `context_agent` | Client account researcher | Pulls client-specific history, stakeholder map, open threads, sensitivities from the `client_context` KB; loop-guarded peer bounce | ↔ `research_agent` (one bounce/session) |
-| `consultant_agent` | Engagement consultant | `@pre_compose` pulls its own brief + research corpus + account context + prior deliverables; reasons (Claude + 8 k thinking) **and** writes the first-pass deliverable with `[cite:]` tags; `@compose` shapes SME vs QA payloads; caps evidence-free confidence | → `sme_human` (low conf / no-evidence), → `qa_agent` (clean) |
+| `engagement_coordinator_agent` | **Engagement coordinator (case owner)** | The POD's single point of contact — opens the case, keeps status, **relays** an IC-edited draft to the lead, escalates. Never does specialist work. Keeps humans first-class with **no human→human wire** (IC tiers hand back here; it routes on) | → `brief_intake_agent` (open), → `engagement_lead_human` (route to review), → `partner_human` (escalate), → `delivery_audit_logger_agent` |
+| `brief_intake_agent` | Intake coordinator | Normalises any inbound ask (email, Slack, SOW, meeting note) into a canonical `EngagementBrief`; enforces the strategic-account → research policy floor | → `context_agent` (always), → `research_agent` (if research required), → `engagement_lead_human` (unworkable brief) |
+| `research_agent` | Research analyst (**Super-Agent**) | Wrapped in the Super-Agent orchestrator (plan → pull → verify → synthesise); pulls prior art via day-0 dev-store tools (`search_prior_art`) + the `industry_reports` KB; a `prior_art_search` / `gap_flagging` **playbook** carries the craft; citation-or-nothing; flags `knowledge_gaps` | ↔ `context_agent` (peer cross-reference, chain); fans in to consultant |
+| `context_agent` | Client account researcher | Pulls client-specific history, stakeholder map, open threads, sensitivities from the `client_context` KB; loop-guarded peer bounce | ↔ `research_agent` (one bounce/session, chain) |
+| `consultant_agent` | Engagement consultant | `@pre_compose` pulls its own brief + research corpus + account context + prior deliverables; reasons (Claude + 8 k thinking) **and** writes the first-pass deliverable with `[cite:]` tags; loads the firm **house-style skills** + a `build_memo` / `build_recommendation` playbook; `@compose` shapes SME vs QA payloads; caps evidence-free confidence | → `sme_human` (low conf / no-evidence), → `qa_agent` (clean) |
 | `qa_agent` | Quality reviewer | `@pre_compose` pulls the engagement record; `@chain` `qa_floor` enforces the QA gate (uncited/bad-cite/contradiction → reject), a deterministic PII scan, and stakes→tier derivation — none waivable; visible tier wires route on the derived fields | → `citation_agent`, → `engagement_lead_human` (always), → `partner_human` (PII), → `sme_human` / `senior_consultant_human` / `associate_human` (tier) |
 | `citation_agent` | Citations checker | Deterministic verification that every `[cite:]` resolves to a *retrievable* source (the corpus in dev, your KB/RAG in prod); coverage floor 80% (Python control, not LLM judgment) | → `engagement_lead_human` (gaps), → `delivery_audit_logger_agent` (clean) |
 | `engagement_controller_agent` | Engagement controller | SOW-drift judgment over PSA-supplied hours; surfaces scope creep and change-order candidates; never recomputes the PSA's numbers | → `engagement_lead_human` (action needed), → `delivery_audit_logger_agent` (clean) |
 | `timesheet_connector_agent` | Timesheet/PSA liaison | Forwards time entries to and pulls hours + budget position from your PSA/timesheet system (n8n connector) | → `engagement_controller_agent` (when PSA resolves the engagement) |
-| `status_sweep_orchestrator_agent` | Delivery PMO coordinator | Weekly status sweep across active engagements from your PSA/project tracker (n8n connector; cron commented until wired) | terminal (n8n posts the report) |
+| `status_sweep_orchestrator_agent` | Delivery PMO coordinator | Weekly status sweep — **`instances: 3` parallel copies** each **atomically claim** one active engagement from the backlog (`claim_next_active_engagement`) so they split the work, then combine once; live Monday cron with a `timezone` | → `engagement_lead_human` (blocked/overdue), → `delivery_audit_logger_agent` (clean) |
 | `engagement_status_drafter_agent` | Client communications drafter | `@pre_compose` pulls its own engagement record; drafts the weekly Friday status report / daily standup brief / monthly steering pack; caps confidence on an empty week | → `engagement_lead_human` (review before send — never auto-sent) |
 | `performance_review_agent` | People-ops review drafter | Drafts consultant Q/annual reviews weighting client csat + repeat engagement + outcomes over utilisation; HR system signs | → `partner_human` (principal-track), → `engagement_lead_human` (PIP/exit/routine) |
 | `doc_extraction_agent` | Knowledge manager | At engagement close, mines deliverables for reusable IP, anonymises the client, tags reusability, skips client-specific content | → `sme_human` (high-reusability review) |
-| `associate_human` | Associate / IC (tier 1) | Editing + personalisation pass on routine deliverables | → `engagement_lead_human`, → `senior_consultant_human` (escalate), → `research_agent` (more research) |
-| `senior_consultant_human` | Senior consultant (tier 2) | Editing pass on strategic accounts and recommendation deliverables | → `engagement_lead_human` |
-| `sme_human` | Subject-matter expert | Depth review on regulated / tax / healthcare / security / legal areas and low-confidence drafts | → `engagement_lead_human`, → `partner_human` (escalate) |
-| `engagement_lead_human` | Engagement lead / PM | Owns the relationship; **always** reviews before the client sees any output; default-deny on timeout | → `delivery_audit_logger_agent`, → `partner_human` (escalate) |
+| `associate_human` | Associate / IC (tier 1) | Editing + personalisation pass on routine deliverables (webhook inbox; default-deny on timeout) | → `research_agent` (more research), → `engagement_coordinator_agent` (edited / escalate), → `delivery_audit_logger_agent` (held) |
+| `senior_consultant_human` | Senior consultant (tier 2) | Editing pass on strategic accounts and recommendation deliverables (default-deny) | → `engagement_coordinator_agent` (edited / escalate), → `delivery_audit_logger_agent` (held) |
+| `sme_human` | Subject-matter expert | Depth review on regulated / tax / healthcare / security / legal areas and low-confidence drafts (default-deny) | → `engagement_coordinator_agent` (edited / escalate), → `delivery_audit_logger_agent` (held) |
+| `engagement_lead_human` | Engagement lead / PM | Owns the relationship; **always** reviews before the client sees any output; default-deny on timeout | → `deliverable_assembler_agent` (approve → finisher), → `engagement_coordinator_agent` (escalate), → `delivery_audit_logger_agent` (rework / hold) |
+| `deliverable_assembler_agent` | Deliverable assembler (**finisher**) | Runs AFTER lead approval; re-checks approval (allow/deny tokens, **fail-closed on unknown**) + QA, renders the real client document to `./out/*.md\|pdf`, **deletes any partial on a block**; day-0 archive write via the dev store | → `delivery_audit_logger_agent` |
 | `partner_human` | Partner | Exec sponsor and escalation tier; default-deny on timeout | → `delivery_audit_logger_agent` |
 | `delivery_audit_logger_agent` | Compliance / audit recorder | Hash-chained WORM audit of every QA outcome, edit, approval, escalation | terminal |
 
 ## Entry points (start from anywhere)
 
-`new_engagement`, `client_question`, `weekly_sync` (cron),
-`deliverable_due`, `escalation_received`, `knowledge_update`,
-`manual_action`, `draft_client_status`, `daily_standup_brief`,
-`log_time_entry`, `scope_creep_check`, `monthly_steering_pack`,
-`draft_consultant_review`, `engagement_close_knowledge_capture`, plus
-direct-call entries for ad-hoc/debug invocation.
+`new_engagement` (→ coordinator opens the case), `engagement_status`
+(→ coordinator answers from the case record), `client_question`,
+`weekly_sync` (cron), `deliverable_due`, `escalation_received`,
+`knowledge_update`, `manual_action`, `draft_client_status`,
+`daily_standup_brief`, `log_time_entry`, `scope_creep_check`,
+`monthly_steering_pack`, `draft_consultant_review`,
+`engagement_close_knowledge_capture`, plus direct-call entries for
+ad-hoc/debug invocation.
 
 ## Trust mechanisms (deterministic floors the LLM can't waive)
 
@@ -192,10 +210,19 @@ not asked for in a prompt:
 And the structural guarantees:
 
 - **Engagement lead always reviews** — no auto-deliver to client, ever
+- **Finisher, fail-closed** — `deliverable_assembler_agent` re-checks lead
+  approval by allow/deny token (fail-closed on an unknown verdict) + QA,
+  renders the real document, and **deletes any partial on a block**
+- **No human→human wire** — humans are first-class but never call each
+  other; IC tiers hand their edited draft back to the **coordinator**
+  (dual→chain), which routes it on (chain→dual). No `dual↔dual` ping-pong
+- **AI specialists are `chain`** — `dual` lives only on the human/webhook
+  boundary agents (gotcha #17)
 - **Bounded peer loop** — research↔context capped at one bounce/session
 - **Hash-chained WORM** — every QA outcome, edit, approval, escalation
-- **HITL fallback chain** — associate → senior → lead → partner → halt
-  (all default-deny on timeout)
+- **HITL default-deny** — every gate `fallback_on_timeout` → `held_for_review`
+  → the WORM audit sink; silence never advances an engagement. Human→human
+  escalation is carried by the Manager **supervisor** (`escalation.targets`)
 
 ## YAML-first, with hands where roles need them
 

@@ -223,3 +223,82 @@ def put_deliverable(deliverable: dict[str, Any]) -> dict[str, Any]:
         s[did] = {**s.get(did, {}), **deliverable}
         _save("deliverables", s)
         return s[did]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ACTIVE-ENGAGEMENT BACKLOG — the weekly status sweep fans out over this.
+# The parallel `status_sweep_orchestrator_agent` instances each CLAIM one
+# row atomically so the copies split the backlog instead of duplicating it.
+# PROD: this list is a query against your PSA / project tracker (Kantata,
+# Asana, Monday, Jira); the claim is a `SELECT … FOR UPDATE SKIP LOCKED`
+# (or Redis LPOP). The dev store below stands in day-0.
+# ═══════════════════════════════════════════════════════════════════════
+_SEED_ACTIVE_ENGAGEMENTS = [
+    {"engagement_id": ACME_ENGAGEMENT, "client_name": "Acme Industries",
+     "stage": "analysis", "deadline_utc": "2026-06-26T17:00:00Z",
+     "blocker": "", "days_overdue": 0},
+    {"engagement_id": "eng-globex-cost-model", "client_name": "Globex",
+     "stage": "research", "deadline_utc": "2026-07-03T17:00:00Z",
+     "blocker": "awaiting client cost data", "days_overdue": 0},
+    {"engagement_id": "eng-initech-ops-review", "client_name": "Initech",
+     "stage": "qa", "deadline_utc": "2026-05-30T17:00:00Z",
+     "blocker": "", "days_overdue": 6},
+]
+
+
+def _active_backlog() -> list[dict[str, Any]]:
+    """The active-engagement backlog (seeded once, then persisted)."""
+    s = _load("active_engagements")
+    if not s:
+        s = {"queue": [dict(r) for r in _SEED_ACTIVE_ENGAGEMENTS], "claimed": {}}
+        _save("active_engagements", s)
+    return s  # type: ignore[return-value]
+
+
+def claim_next_active_engagement(worker_id: str = "") -> dict[str, Any]:
+    """Atomically claim ONE unclaimed active engagement for a sweep worker.
+
+    Returns {available: True, ...engagement...} for the claimed row, or
+    {available: False, reason: ...} when the backlog is exhausted — NEVER a
+    synthetic engagement. The claim is atomic under the process lock (PROD:
+    SELECT … FOR UPDATE SKIP LOCKED / Redis LPOP), so parallel copies split
+    the backlog instead of duplicating work.
+    """
+    with _LOCK:
+        s = _active_backlog()
+        queue = s.get("queue") or []
+        if not queue:
+            return {"available": False,
+                    "reason": "active-engagement backlog is empty — nothing to claim"}
+        row = queue.pop(0)
+        s["claimed"][row["engagement_id"]] = {
+            "worker_id": str(worker_id or ""), "claimed_at": _now()}
+        _save("active_engagements", s)
+        return {"available": True, **row}
+
+
+# ── Research corpus search (dev-store fallback for the KB/RAG connector) ──
+def search_prior_art(engagement_id: str = "", practice_area: str = "") -> dict[str, Any]:
+    """Return prior-art sources for an engagement's practice area.
+
+    Announces itself: {available: False, reason} when there is genuinely
+    nothing to return, rather than an empty-but-confident hit. PROD: your
+    KB/RAG semantic search.
+    """
+    pa = (practice_area or "").strip().lower()
+    if not pa and engagement_id:
+        pa = str(get_brief(engagement_id).get("practice_area", "")).lower()
+    rows = research_corpus(pa)
+    if not rows:
+        return {"available": False,
+                "reason": f"no prior art for practice_area={pa or '-'!r}; wire KB_MCP_URL"}
+    return {"available": True, "practice_area": pa, "sources": rows,
+            "resolvable_source_ids": sorted(corpus_source_ids())}
+
+
+def list_resolvable_sources() -> dict[str, Any]:
+    """Every retrievable source_id — the citation-or-nothing resolvable set."""
+    ids = sorted(corpus_source_ids())
+    if not ids:
+        return {"available": False, "reason": "no corpus loaded; wire KB_MCP_URL"}
+    return {"available": True, "resolvable_source_ids": ids}
