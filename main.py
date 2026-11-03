@@ -40,11 +40,8 @@ async def main():
     leafmesh.event_bus.subscribe(EventType.INTERVENTION_NEEDED,   _on_intervention_needed)
     leafmesh.event_bus.subscribe(EventType.HUMAN_INPUT_TIMEOUT,   _on_human_input_timeout)
 
-    try:
-        await leafmesh.enable_self_healing()
-        logger.info("Self-healing enabled")
-    except AttributeError:
-        pass
+    # Self-healing is automatic — the SDK enables it during start() on
+    # every operator-facing mesh. No call is needed.
 
     logger.info("services-delivery — Services Delivery mesh running")
     logger.info("API docs: http://127.0.0.1:18820/docs")

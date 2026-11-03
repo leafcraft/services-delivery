@@ -120,29 +120,31 @@ alone; tiers 2–3 light up host prerequisites and external systems.
 | Var | Purpose |
 |---|---|
 | `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` | Engagement context, deliverable history, session store (30-day TTL). Defaults to `localhost:6379` |
-| `HITL_OUTBOUND_URL` | Webhook the human members notify (inbox / Studio adapter). Defaults to `http://127.0.0.1:9999/human-notify` |
-| `PAGER_WEBHOOK` | Escalation webhook target (defaults to a PagerDuty Events v2 URL) |
+| *(vault connection `escalation_webhook`)* | Escalation webhook target (e.g. PagerDuty): create vault connection `escalation_webhook` (an "Add custom" record on the Infrastructure page, service type 'Outbound webhook'), then uncomment the webhook target (in `configs/config.yaml` before the first start, in Studio's YAML editor after it — see *Changing the configuration after the first start*) |
 | `LEAFMESH_ENV_TOKEN` | Host/SDK environment token |
 
 ### Tier 3 — connectors (optional; light up external systems)
 | Var | Purpose |
 |---|---|
-| `PSA_TIMESHEET_WEBHOOK_URL` / `PSA_TIMESHEET_AUTH_TOKEN` | n8n workflow fronting your PSA/timesheet system (Harvest, Toggl, ClickTime, Tempo, Kantata) — hours + budget position |
-| `PSA_STATUS_SWEEP_WEBHOOK_URL` / `PSA_STATUS_SWEEP_AUTH_TOKEN` | n8n workflow fronting your PSA/project tracker (Kantata, Asana, Jira, Monday) — active-engagement sweep (the sweep runs day-0 on the seed backlog until wired) |
-| `KB_MCP_URL` / `KB_MCP_TOKEN` | Your KB / RAG for `research_agent`; set it, then uncomment the `mcp:` block in `configs/config.yaml` |
-| `SLACK_DELIVERY_CHANNEL` | `channel_id` the escalation `channel` target posts to |
-| `SLACK_BOT_TOKEN` / `SLACK_SIGNING_SECRET` | Fields of a `channels: {slack: {...}}` block (ChannelConfig) — **not** auto-consumed by the escalation channel target. Add a `channels:` block to `configs/config.yaml` to actually deliver Slack messages |
+| vault connection `psa_timesheet_n8n` | n8n workflow fronting your PSA/timesheet system (Harvest, Toggl, ClickTime, Tempo, Kantata) — hours + budget position. Create it on Infrastructure → Integrations → n8n (base URL = the workflow's webhook URL), then uncomment `connection: psa_timesheet_n8n` on `timesheet_connector_agent` |
+| vault connection `kb_mcp` | Your KB / RAG MCP server for `research_agent`; create it on Infrastructure → Integrations → MCP, then uncomment the `mcp:` block (in `configs/config.yaml` before the first start, in Studio's YAML editor after it). The day-0 research tools count the KB as wired as soon as this record exists. |
+| `SLACK_DELIVERY_CHANNEL` | `channel_id` for the escalation `channel` target, which ships **commented** (day 0 the partner gets every escalation in the Inbox). To turn it on: connect Slack on Infrastructure → Messaging → Slack (the bot token and signing secret live there, never in `.env`), give `partner_human` `channels: {slack: {connection: <name>}}`, set this id, then uncomment the target |
 
 The `status_sweep_orchestrator_agent` sweep runs **day-0** on its live
 Monday cron against the seed backlog (via the `claim_next_active_engagement`
 dev-store tool); wiring tier 3 only swaps that tool's body for your PSA
-query. After wiring tier 3, un-comment the `# wake_up:` cron on
-`timesheet_connector_agent` in `configs/config.yaml`, and uncomment the
-`# mcp:` block on `research_agent` once you set `KB_MCP_URL`.
+query. (2.4.484's `scaling.copies.mode: auto` with `claim_tool:
+claim_next_active_engagement` could replace this manual split — an owner
+decision, not made in this template.) After wiring tier 3, un-comment the `# wake_up:` cron on
+`timesheet_connector_agent`, and uncomment the `# mcp:` block on
+`research_agent` once you create the `kb_mcp` vault connection — in
+`configs/config.yaml` before the first start, in Studio's YAML editor (or
+`PUT /api/yaml/raw`) after it; it applies live, no restart.
 
-> **HITL delivery:** the human members use `human_interface: webhook`
-> (`HITL_OUTBOUND_URL`, default `http://127.0.0.1:9999/human-notify`) —
-> point it at your inbox/Studio adapter to actually reach people.
+> **HITL delivery:** the human members answer in Studio's Inbox. To notify an
+> external tool instead, create a vault connection (an "Add custom" record
+> on the Infrastructure page, service type 'Outbound webhook') and set
+> `webhook_config: {connection: <name>}` on the seat.
 
 ## Agents
 
@@ -161,16 +163,16 @@ lead owns all client contact.
 | `citation_agent` | Citations checker | Deterministic verification that every `[cite:]` resolves to a *retrievable* source (the corpus in dev, your KB/RAG in prod); coverage floor 80% (Python control, not LLM judgment) | → `engagement_lead_human` (gaps), → `delivery_audit_logger_agent` (clean) |
 | `engagement_controller_agent` | Engagement controller | SOW-drift judgment over PSA-supplied hours; surfaces scope creep and change-order candidates; never recomputes the PSA's numbers | → `engagement_lead_human` (action needed), → `delivery_audit_logger_agent` (clean) |
 | `timesheet_connector_agent` | Timesheet/PSA liaison | Forwards time entries to and pulls hours + budget position from your PSA/timesheet system (n8n connector) | → `engagement_controller_agent` (when PSA resolves the engagement) |
-| `status_sweep_orchestrator_agent` | Delivery PMO coordinator | Weekly status sweep — **`instances: 3` parallel copies** each **atomically claim** one active engagement from the backlog (`claim_next_active_engagement`) so they split the work, then combine once; live Monday cron with a `timezone` | → `engagement_lead_human` (blocked/overdue), → `delivery_audit_logger_agent` (clean) |
+| `status_sweep_orchestrator_agent` | Delivery PMO coordinator | Weekly status sweep — **3 parallel copies (`scaling.copies.count: 3`)** each **atomically claim** one active engagement from the backlog (`claim_next_active_engagement`) so they split the work, then combine once; live Monday cron with a `timezone` | → `engagement_lead_human` (blocked/overdue), → `delivery_audit_logger_agent` (clean) |
 | `engagement_status_drafter_agent` | Client communications drafter | `@pre_compose` pulls its own engagement record; drafts the weekly Friday status report / daily standup brief / monthly steering pack; caps confidence on an empty week | → `engagement_lead_human` (review before send — never auto-sent) |
 | `performance_review_agent` | People-ops review drafter | Drafts consultant Q/annual reviews weighting client csat + repeat engagement + outcomes over utilisation; HR system signs | → `partner_human` (principal-track), → `engagement_lead_human` (PIP/exit/routine) |
 | `doc_extraction_agent` | Knowledge manager | At engagement close, mines deliverables for reusable IP, anonymises the client, tags reusability, skips client-specific content | → `sme_human` (high-reusability review) |
-| `associate_human` | Associate / IC (tier 1) | Editing + personalisation pass on routine deliverables (webhook inbox; default-deny on timeout) | → `research_agent` (more research), → `engagement_coordinator_agent` (edited / escalate), → `delivery_audit_logger_agent` (held) |
-| `senior_consultant_human` | Senior consultant (tier 2) | Editing pass on strategic accounts and recommendation deliverables (default-deny) | → `engagement_coordinator_agent` (edited / escalate), → `delivery_audit_logger_agent` (held) |
-| `sme_human` | Subject-matter expert | Depth review on regulated / tax / healthcare / security / legal areas and low-confidence drafts (default-deny) | → `engagement_coordinator_agent` (edited / escalate), → `delivery_audit_logger_agent` (held) |
-| `engagement_lead_human` | Engagement lead / PM | Owns the relationship; **always** reviews before the client sees any output; default-deny on timeout | → `deliverable_assembler_agent` (approve → finisher), → `engagement_coordinator_agent` (escalate), → `delivery_audit_logger_agent` (rework / hold) |
+| `associate_human` | Associate / IC (tier 1) | Editing + personalisation pass on routine deliverables (Inbox, 4 h) | → `research_agent` (more research), → `engagement_coordinator_agent` (edited / escalate), → `delivery_audit_logger_agent` (anything else) |
+| `senior_consultant_human` | Senior consultant (tier 2) | Editing pass on strategic accounts and recommendation deliverables (Inbox, 6 h) | → `engagement_coordinator_agent` (edited / escalate), → `delivery_audit_logger_agent` (anything else) |
+| `sme_human` | Subject-matter expert | Depth review on regulated / tax / healthcare / security / legal areas and low-confidence drafts (Inbox, 8 h) | → `engagement_coordinator_agent` (edited / escalate), → `delivery_audit_logger_agent` (anything else) |
+| `engagement_lead_human` | Engagement lead / PM | Owns the relationship; **always** reviews before the client sees any output (Inbox, 6 h) | → `deliverable_assembler_agent` (approve → finisher), → `engagement_coordinator_agent` (escalate), → `delivery_audit_logger_agent` (rework / anything else) |
 | `deliverable_assembler_agent` | Deliverable assembler (**finisher**) | Runs AFTER lead approval; re-checks approval (allow/deny tokens, **fail-closed on unknown**) + QA, renders the real client document to `./out/*.md\|pdf`, **deletes any partial on a block**; day-0 archive write via the dev store | → `delivery_audit_logger_agent` |
-| `partner_human` | Partner | Exec sponsor and escalation tier; default-deny on timeout | → `delivery_audit_logger_agent` |
+| `partner_human` | Partner | Exec sponsor and escalation tier (Inbox, 12 h); the Manager's escalation target | → `delivery_audit_logger_agent` |
 | `delivery_audit_logger_agent` | Compliance / audit recorder | Hash-chained WORM audit of every QA outcome, edit, approval, escalation | terminal |
 
 ## Entry points (start from anywhere)
@@ -220,9 +222,18 @@ And the structural guarantees:
   boundary agents (gotcha #17)
 - **Bounded peer loop** — research↔context capped at one bounce/session
 - **Hash-chained WORM** — every QA outcome, edit, approval, escalation
-- **HITL default-deny** — every gate `fallback_on_timeout` → `held_for_review`
-  → the WORM audit sink; silence never advances an engagement. Human→human
-  escalation is carried by the Manager **supervisor** (`escalation.targets`)
+- **Silence never advances an engagement** — if nobody answers a gate in
+  time, the request waits no longer: its Inbox card closes and the ticket
+  records that no reply came. Nothing reaches the client and nobody is
+  chased automatically. Every seat routes every reply: the words its
+  prompt asks for, and anything else → the WORM audit. The Manager
+  escalates to the partner only when an agent hits an error a retry cannot
+  fix, when 3 different agents fail in one session, or when restarts run
+  out
+- **Fan-in, said plainly** — the consultant waits for context (research
+  optional). If research arrives after the consultant has already run, the
+  consultant runs again on everything gathered (an update), so a second
+  draft can reach QA and the human reviewers for the same deliverable
 
 ## YAML-first, with hands where roles need them
 
@@ -262,3 +273,33 @@ python main.py         # API docs: http://127.0.0.1:18820/docs
 pip install -r requirements-dev.txt
 pytest tests/ -q
 ```
+
+## Changing the configuration after the first start
+
+`configs/config.yaml` is only the first-start seed. On the first start (an empty store) the agency imports it as version 1 and from then on keeps its configuration in the store. After that the file is not read again: an edit to it is **not** applied, even after a restart (the boot log says "that edit was NOT applied").
+
+To change a running agency:
+
+- **Studio** — its settings pages, or the raw YAML editor.
+- **API** — `PUT /api/yaml/raw` with an `X-API-Key` header and the body `{"yaml_content": "<the whole YAML>", "save_to_disk": true}`, or `PATCH /api/yaml/config` with `{"updates": {...}, "save_to_disk": true}`.
+
+Each save is a new version and applies live on every pod — no restart. (A few settings, such as brokers, make the agency reload itself in place within seconds.) So wherever this README or a comment says "uncomment X in `configs/config.yaml`", do it in the file before the first start, or in Studio's YAML editor after it.
+
+## Where the data store is set
+
+From leafmesh 2.4.482 the store (Redis or Postgres) is set **only in `.env`** — never in `configs/config.yaml`. A `persistence:` block in the YAML is ignored with a warning on leafmesh 2.4.482–2.4.485; from 2.4.486 the agency refuses to start if that block differs from `.env`, and names each `.env` line to add. The project's `.env` sets the store explicitly (`LEAFMESH_STORE`, `LEAFMESH_AGENCY_NAME`, `REDIS_*`).
+
+- Redis (default): `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`, `REDIS_DB`; optional `REDIS_DEFAULT_TTL`, `REDIS_SESSION_TTL`, `REDIS_SSL*`, `REDIS_CLUSTER_NODES`.
+- Postgres instead: `LEAFMESH_STORE=postgres` plus `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` (optional `POSTGRES_SSLMODE`).
+- Or the whole server in one value: `REDIS_URL=redis://user:pw@host:6379/0` (`rediss://` turns TLS on) or `DATABASE_URL=postgresql://user:pw@host:5432/db`. The single names fill in what the URL leaves out.
+- With Docker Compose the app reaches Redis as `redis` (the service name); compose sets that for you.
+- Check it in Studio → **Infrastructure → Datastores**: it shows whether the store is reachable (never the address or password).
+
+## Your vault key — back it up
+
+`create-leafmesh` put a `LEAFMESH_VAULT_KEY` in your `.env` when it made this project. It is the master key that encrypts every connection and credential you store in the vault (in Redis / Postgres).
+
+- **Back it up like a master password.** Lose it and every stored connection has to be entered again.
+- **Never change or regenerate it** for an existing project — a new key locks the existing vault. To change it, use `leafmesh vault rotate-key`.
+- Every copy of the app (every replica) must get the **same** value. Docker Compose passes it in from `.env` as an environment variable.
+- Never commit `.env` (it is already in `.gitignore`).

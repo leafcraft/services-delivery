@@ -80,10 +80,10 @@ _SEED_BRIEFS = {
         "scope_summary": "Board-ready memo on whether Acme should enter the EU "
                          "B2B logistics market — regulatory landscape, top-3 "
                          "competitive positioning, go/no-go recommendation.",
-        "deadline_utc": "2026-06-26T17:00:00Z",
+        "deadline_utc": "2026-11-13T17:00:00Z",
         "strategic_account": True,
         "requires_research": True,
-        "received_at_utc": "2026-06-23T13:40:00Z",
+        "received_at_utc": "2026-10-29T13:40:00Z",
     },
 }
 
@@ -131,7 +131,7 @@ _SEED_ACCOUNTS = {
             {"name": "L. Méndez", "role": "VP Strategy", "disposition": "skeptic"},
         ],
         "open_threads": [
-            "Board wants a go/no-go by end of Q2; COO leans go, VP Strategy "
+            "Board wants a go/no-go at its 20 Nov meeting; COO leans go, VP Strategy "
             "wants the regulatory risk quantified first.",
         ],
         "sensitivities": [
@@ -227,7 +227,7 @@ def put_deliverable(deliverable: dict[str, Any]) -> dict[str, Any]:
 
 # ═══════════════════════════════════════════════════════════════════════
 # ACTIVE-ENGAGEMENT BACKLOG — the weekly status sweep fans out over this.
-# The parallel `status_sweep_orchestrator_agent` instances each CLAIM one
+# The parallel `status_sweep_orchestrator_agent` copies each CLAIM one
 # row atomically so the copies split the backlog instead of duplicating it.
 # PROD: this list is a query against your PSA / project tracker (Kantata,
 # Asana, Monday, Jira); the claim is a `SELECT … FOR UPDATE SKIP LOCKED`
@@ -235,13 +235,13 @@ def put_deliverable(deliverable: dict[str, Any]) -> dict[str, Any]:
 # ═══════════════════════════════════════════════════════════════════════
 _SEED_ACTIVE_ENGAGEMENTS = [
     {"engagement_id": ACME_ENGAGEMENT, "client_name": "Acme Industries",
-     "stage": "analysis", "deadline_utc": "2026-06-26T17:00:00Z",
+     "stage": "analysis", "deadline_utc": "2026-11-13T17:00:00Z",
      "blocker": "", "days_overdue": 0},
     {"engagement_id": "eng-globex-cost-model", "client_name": "Globex",
-     "stage": "research", "deadline_utc": "2026-07-03T17:00:00Z",
+     "stage": "research", "deadline_utc": "2026-11-20T17:00:00Z",
      "blocker": "awaiting client cost data", "days_overdue": 0},
     {"engagement_id": "eng-initech-ops-review", "client_name": "Initech",
-     "stage": "qa", "deadline_utc": "2026-05-30T17:00:00Z",
+     "stage": "qa", "deadline_utc": "2026-10-28T17:00:00Z",
      "blocker": "", "days_overdue": 6},
 ]
 
@@ -291,7 +291,7 @@ def search_prior_art(engagement_id: str = "", practice_area: str = "") -> dict[s
     rows = research_corpus(pa)
     if not rows:
         return {"available": False,
-                "reason": f"no prior art for practice_area={pa or '-'!r}; wire KB_MCP_URL"}
+                "reason": f"no prior art for practice_area={pa or '-'!r}; the KB vault record 'kb_mcp' is not wired"}
     return {"available": True, "practice_area": pa, "sources": rows,
             "resolvable_source_ids": sorted(corpus_source_ids())}
 
@@ -300,5 +300,5 @@ def list_resolvable_sources() -> dict[str, Any]:
     """Every retrievable source_id — the citation-or-nothing resolvable set."""
     ids = sorted(corpus_source_ids())
     if not ids:
-        return {"available": False, "reason": "no corpus loaded; wire KB_MCP_URL"}
+        return {"available": False, "reason": "no corpus loaded; the KB vault record 'kb_mcp' is not wired"}
     return {"available": True, "resolvable_source_ids": ids}
