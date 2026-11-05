@@ -8,9 +8,9 @@
 # client ever sees it.
 #
 # Rule 1: peer-to-peer. research ↔ context cross-reference; brief
-# fans out to research+context in parallel; the consultant fans in;
-# QA can kick the draft back with a feedback rerun (yields-driven
-# enforcement).
+# fans out to research+context in parallel; the consultant fans in
+# (context delivers to it); QA routes the draft to the right human
+# editing tier and the engagement lead.
 #
 # ═══════════════════════════════════════════════════════════════════
 # WHY LEAFMESH (the value the ROI calculator quantifies)
@@ -26,19 +26,20 @@
 #
 # Control-plane primitives this template uses:
 #   1. PEER-TO-PEER — brief fans to research+context in parallel;
-#      research ↔ context call each other; the consultant fans in;
-#      QA can send the draft back with feedback (yields-driven retry).
+#      research ↔ context call each other (one bounded bounce); the
+#      consultant fans in; QA routes to the human editing tier.
 #   2. MULTI-ENTRY — 7 entry points (kickoff, client question, weekly
 #      sync, deliverable due, escalation, knowledge update, manual).
 #   3. NEVER AUTO-DELIVER — engagement_lead_human ALWAYS reviews
 #      before the client sees output. No bypass.
 #   4. CITATION-OR-NOTHING — any factual claim must have a citation
-#      (citation_agent enforces). Uncited claims trigger a rerun.
+#      (citation_agent checks). Citation gaps go to the engagement lead,
+#      and the assembler refuses to compile a draft with uncited claims.
 #   5. KNOWLEDGE-GROUNDED — past_projects, methodology, industry_reports,
 #      client_context. Domain SMEs update the docs; agents pick them
 #      up immediately.
 #   6. THINKING MODE on the consultant — Claude Sonnet with
-#      thinking_budget for the reasoning-heavy step.
+#      reasoning_budget for the reasoning-heavy step.
 #   7. SCHEDULED weekly-sync — status_sweep_orchestrator pulls the
 #      active-engagement sweep from YOUR PSA / project tracker (cron
 #      ships commented out until the connector is wired).
@@ -56,21 +57,6 @@ architecture: "managed_mesh"
 environment: "development"
 debug: true
 log_level: "INFO"
-
-# ═══════════════════════════════════════════════════════════════════
-# REDIS — engagement context, deliverable history, citation cache
-# ═══════════════════════════════════════════════════════════════════
-persistence:
-  backend: redis
-  redis:
-    host: "${REDIS_HOST:localhost}"
-    port: ${REDIS_PORT:6379}
-    db: 0
-    password: "${REDIS_PASSWORD:}"
-    auto_storage: true
-    decode_responses: true
-    default_ttl: 86400
-    session_ttl: 2592000             # 30 days — engagement state outlives sessions
 
 # ═══════════════════════════════════════════════════════════════════
 # AUTO-DISCOVER
@@ -106,12 +92,13 @@ manager:
         system via timesheet_connector_agent; engagement_controller
         judges SOW drift on top of those numbers
 
-    Escalate when:
-      - QA finds uncited factual claims after 2 retries
-      - consultant confidence < 0.7 on a strategic engagement
-      - deliverable due within 24h and engagement_lead hasn't responded
-      - client escalation received (immediate to partner_human)
-      - same client gets the same "I don't know" answer 3+ times
+    The business gates are wires, not your job: low consultant confidence
+    goes to the SME, uncited claims to the engagement lead (citation_agent),
+    PII to the partner (qa_agent), a client escalation to the partner (the
+    coordinator). Escalate to the partner only when an agent fails in a way
+    a retry will not fix, or keeps failing. A review nobody answers is not
+    escalated: the request waits its time and stops, and nothing reaches
+    the client on silence.
 
     Watch for:
       - patterns where research has thin knowledge coverage
@@ -137,25 +124,33 @@ manager:
     targets:
       - type: "human_agent"
         agent: "partner_human"
-      - type: "webhook"
-        url: "${PAGER_WEBHOOK:https://events.pagerduty.com/v2/enqueue}"
-        method: "POST"
-        headers:
-          Content-Type: "application/json"
-        payload_template:
-          incident_id: "{{engagement_id}}"
-          severity: "{{severity}}"
-          message: "{{message}}"
-          session_id: "{{session_id}}"
-      - type: "channel"
-        provider: "slack"
-        channel_id: "${SLACK_DELIVERY_CHANNEL:}"
-        message_template: "[delivery] {{message}} — engagement {{engagement_id}} (session {{session_id}})"
+      # Webhook escalation (e.g. PagerDuty): create the vault connection
+      # 'escalation_webhook' (an "Add custom" record on the Infrastructure
+      # page, service type 'Outbound webhook'), then uncomment — here before the
+      # first start, in Studio's YAML editor after it (applies live, no restart).
+      # - type: "webhook"
+        # connection: escalation_webhook   # vault connection holds the URL + headers
+        # method: "POST"
+        # payload_template:
+          # incident_id: "{{engagement_id}}"
+          # severity: "{{severity}}"
+          # message: "{{message}}"
+          # session_id: "{{session_id}}"
+      # Slack escalation: posting needs a Slack adapter, which comes from a
+      # human seat's channels block. Connect Slack on Infrastructure →
+      # Messaging → Slack (vault record, e.g. 'slack_delivery'), give
+      # partner_human `channels: {slack: {connection: slack_delivery}}`, set
+      # SLACK_DELIVERY_CHANNEL in .env, then uncomment — here before the first
+      # start, in Studio's YAML editor after it. Shipped commented: with no
+      # adapter the target cannot deliver anything.
+      # - type: "channel"
+        # provider: "slack"
+        # channel_id: "${SLACK_DELIVERY_CHANNEL:}"
+        # message_template: "[delivery] {{message}} — engagement {{engagement_id}} (session {{session_id}})"
 
     auto_escalate:
       max_retries: 2
       max_errors_per_session: 3
-      timeout_threshold: 2
 
   health_check_interval: 60
   agent_timeout_threshold: 300       # analysis can run long
@@ -164,8 +159,9 @@ manager:
 # ═══════════════════════════════════════════════════════════════════
 # MESH
 # ═══════════════════════════════════════════════════════════════════
-mesh:
-  call_timeout: 120                   # consulting research is slower than ticket triage
+timeouts:
+  mesh_call_default_timeout_s: 120                   # consulting research is slower than ticket triage
+
 
 # ═══════════════════════════════════════════════════════════════════
 # DATA STRUCTURES
@@ -509,7 +505,7 @@ agents:
       requires_research: "boolean"
       raw_payload: "object"
       requires_human_clarification: "boolean"   # completeness_floor @chain — true when scope/stakes/deadline missing
-      missing_fields: "list"                     # completeness_floor @chain — which required fields were empty
+      missing_fields: {type: array, items: string}                     # completeness_floor @chain — which required fields were empty
 
     inputs:
       brief_payload: "object"
@@ -619,8 +615,8 @@ agents:
       groupName: "industry_reports"
 
     yields:
-      findings: "list"                  # list of {topic, summary, source_id, confidence}
-      knowledge_gaps: "list"            # topics with no good source — flag for ingestion
+      findings: {type: array, items: object}                  # list of {topic, summary, source_id, confidence}
+      knowledge_gaps: {type: array, items: string}            # topics with no good source — flag for ingestion
       confidence: "number"
 
     inputs:
@@ -672,15 +668,15 @@ agents:
     tools: [search_prior_art, list_resolvable_sources]
     tool_categories: [research]
 
-    # ── To wire your real KB / RAG, uncomment and set the URL (each named
-    #    action under `use:` becomes its own namespaced tool, e.g.
-    #    kb_semantic_search). NOTE: the SDK REJECTS an http mcp block with an
-    #    EMPTY url at load, so this ships COMMENTED — fill the URL, then
-    #    uncomment. Do NOT also list these under `tools:` (they merge in). ──
+    # ── To wire your real KB / RAG: create the vault connection 'kb_mcp' on
+    #    Infrastructure → Integrations → MCP (the MCP server's URL + token live
+    #    there, never here), then uncomment — here before the first start, in
+    #    Studio's YAML editor after it (applies live). Each named action under `use:`
+    #    becomes its own namespaced tool, e.g. kb_semantic_search. Do NOT also
+    #    list these under `tools:` (they merge in). ──
     # mcp:
-    #   - transport: http
-    #     url: "${KB_MCP_URL}"
-    #     token: "${KB_MCP_TOKEN:}"
+    #   - connection: kb_mcp   # vault connection holds the URL + token
+    #     transport: http
     #     use: [semantic_search, read_document]
     #     name: kb
     #     timeout: 30
@@ -692,7 +688,13 @@ agents:
       - agent: "context_agent"
         condition: "calling_agent_response.confidence >= 0.5"
 
-      # Fan-in to analysis happens via wait_for on analysis side
+      # Fan-in: research is the consultant's OPTIONAL contributor
+      # (wait_for: "context_agent AND research_agent?") — it delivers its
+      # findings there; the join still needs context. If research lands after
+      # the consultant already ran, the consultant runs again on everything
+      # gathered (an update) — see README "Fan-in, said plainly".
+      - agent: "consultant_agent"
+        condition: "always"
 
     auto_store_response: true
     auto_store_yields: true
@@ -760,10 +762,10 @@ agents:
       groupName: "client_context"
 
     yields:
-      client_history: "list"
-      stakeholders: "list"
-      open_threads: "list"
-      sensitivities: "list"
+      client_history: {type: array, items: string}
+      stakeholders: {type: array, items: object}
+      open_threads: {type: array, items: string}
+      sensitivities: {type: array, items: string}
       confidence: "number"
       context_retry_exhausted: "boolean"   # loop guard — true after one context↔research bounce
 
@@ -779,6 +781,13 @@ agents:
       # confidences would otherwise ping-pong until the chain cap.
       - agent: "research_agent"
         condition: "calling_agent_response.confidence < 0.6 and calling_agent_response.context_retry_exhausted == false"
+
+      # Fan-in: context is the consultant's REQUIRED contributor
+      # (wait_for: "context_agent AND research_agent?"), so context must
+      # deliver to it — without this edge the join could never complete.
+      # Exactly the complement of the bounce above.
+      - agent: "consultant_agent"
+        condition: "calling_agent_response.confidence >= 0.6 or calling_agent_response.context_retry_exhausted == true"
 
     auto_store_response: true
     auto_store_yields: true
@@ -799,7 +808,7 @@ agents:
     communication_type: "chain"
 
     thinking: true
-    thinking_budget: 8192
+    reasoning_budget: 8192
     reasoning: true
     enable_prompt_caching: true
 
@@ -933,15 +942,15 @@ agents:
 
     yields:
       hypothesis: "string"
-      supporting_evidence: "list"
-      counter_considerations: "list"
-      open_questions: "list"
+      supporting_evidence: {type: array, items: string}
+      counter_considerations: {type: array, items: string}
+      open_questions: {type: array, items: string}
       confidence: "number"
       requires_sme_review: "boolean"
       executive_takeaway: "string"
       deliverable_id: "string"
-      sections: "list"                  # [{title, body, deliverable_type}]
-      citations: "list"                 # [source_id, claim] pairs
+      sections: {type: array, items: object}                  # [{title, body, deliverable_type}]
+      citations: {type: array, items: {type: object, fields: {source_id: string, section: string}}}                 # [source_id, claim] pairs
       practice_area: "string"           # passthrough — qa's tier wires read it
       deliverable_type: "string"        # passthrough — qa's tier wires read it
       strategic_account: "boolean"      # passthrough — qa's tier wires read it
@@ -1058,14 +1067,14 @@ agents:
 
     yields:
       approved: "boolean"
-      uncited_claims: "list"
-      bad_citations: "list"
-      contradictions: "list"
-      tone_issues: "list"
-      pii_concerns: "list"
+      uncited_claims: {type: array, items: string}
+      bad_citations: {type: array, items: string}
+      contradictions: {type: array, items: string}
+      tone_issues: {type: array, items: string}
+      pii_concerns: {type: array, items: string}
       has_factual_claims: "boolean"
       deliverable_id: "string"          # Identity passthrough — lead sees WHICH deliverable
-      sections: "list"                  # Identity passthrough — lead reviews the actual draft
+      sections: {type: array, items: object}                  # Identity passthrough — lead reviews the actual draft
       practice_area: "string"           # Passthrough — tier wires below read it
       deliverable_type: "string"        # Passthrough — tier wires below read it
       strategic_account: "boolean"      # Passthrough — tier wires below read it
@@ -1177,21 +1186,24 @@ agents:
   status_sweep_orchestrator_agent:
     name: "status_sweep_orchestrator_agent"
     agent_type: "llm"
-    description: "Weekly status sweep — parallel instances each claim one active engagement and report its position"
+    description: "Weekly status sweep — parallel copies each claim one active engagement and report its position"
     model: "gpt-4o-mini"
     temperature: 0.1
     communication_type: "chain"
     max_tool_calls_per_message: 8
 
-    # ── PARALLEL INSTANCES (2.4.118+) — backlog fan-out ──────────────────────
+    # ── PARALLEL COPIES (scaling.copies) — backlog fan-out ───────────────────
     # ONE weekly trigger fans out into N copies IN THE SAME SESSION. Each copy
     # CLAIMS one active engagement from the shared backlog via the ATOMIC claim
     # tool below, so the copies SPLIT the backlog instead of duplicating work
-    # (the merge would honestly show duplicates otherwise). instances_handoff:
+    # (the merge would honestly show duplicates otherwise). copies.handoff:
     # last COMBINES the copies deterministically — lists concatenate, numbers
     # sum (each copy sweeps 1 → the total is the count claimed) — and routes ONCE.
-    instances: 3
-    instances_handoff: last
+    scaling:                      # 2.4.484 (was instances / instances_handoff)
+      copies:
+        mode: fixed
+        count: 3
+        handoff: last
 
     # LIVE wake — Mondays 09:00 in the FIRM's timezone. Without `timezone` a
     # cron runs in UTC (09:00 UTC != 09:00 local). Runs day-0 against the seed
@@ -1232,9 +1244,9 @@ agents:
 
     yields:
       engagements_swept: "number"        # summed across copies = engagements claimed
-      status_lines: "list"               # concatenated across copies
-      blocked_engagements: "list"
-      overdue_engagements: "list"
+      status_lines: {type: array, items: {type: object, fields: {engagement_id: string, stage: string, one_line: string}}}               # concatenated across copies
+      blocked_engagements: {type: array, items: {type: object, fields: {engagement_id: string, blocker: string}}}
+      overdue_engagements: {type: array, items: {type: object, fields: {engagement_id: string, days_overdue: number}}}
 
     inputs:
       trigger: "string"
@@ -1255,21 +1267,18 @@ agents:
     name: "associate_human"
     agent_type: "human"
     description: "Associate / IC — handles the editing + personalisation on routine deliverables"
-    human_interface: "webhook"
+    human_interface: "default"   # the Inbox (no vault connection needed)
     communication_type: "dual"           # dual belongs on the human/webhook boundary
     human_timeout_seconds: 14400         # 4 hours
-    # DEFAULT-DENY on silence: an unanswered edit becomes held_for_review and is
-    # recorded to the WORM sink — the deliverable never advances unattended.
+    # Nothing advances on silence. If nobody answers within 4 h, the request
+    # waits no longer: its Inbox card closes and the ticket records that no
+    # reply came; nobody is chased automatically. The fallback below
+    # (held_for_review → WORM audit) is the declared intent; on SDK 2.4.486 a
+    # dual seat does not route it.
     fallback_on_timeout: true
     fallback_response:
       human_decision: "held"
       human_message: "held_for_review"
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
-      max_retries: 1
-      retry_delay: 2
 
     yields:
       human_message: "string"            # approved_for_lead | needs_more_research | escalate | held_for_review
@@ -1282,8 +1291,11 @@ agents:
     human_prompt_template: |
       Draft for your editing pass. The deliverable goes to the
       engagement lead next — make sure tone + specifics fit this
-      client. If you need more research, kick back to research_agent
-      with a specific ask.
+      client. When done, reply with exactly one word:
+        approved_for_lead    — your edited draft goes to the engagement lead
+        needs_more_research  — back to research (put the ask in your notes)
+        escalate             — the coordinator routes it to the partner
+      Any other reply is recorded and the draft does not move.
 
     can_call:
       # Kick back for more research — human→chain (research_agent), a bounded
@@ -1296,9 +1308,10 @@ agents:
       - agent: "engagement_coordinator_agent"
         condition: "calling_agent_response.human_message == 'approved_for_lead' or calling_agent_response.human_message == 'escalate'"
 
-      # Default-deny terminus.
+      # Anything else (incl. the held_for_review fallback) → recorded; the
+      # draft does not move.
       - agent: "delivery_audit_logger_agent"
-        condition: "calling_agent_response.human_message == 'held_for_review'"
+        condition: "calling_agent_response.human_message != 'needs_more_research' and calling_agent_response.human_message != 'approved_for_lead' and calling_agent_response.human_message != 'escalate'"
 
   # ────────────────────────────────────────────────────────────
   # senior_consultant_human — Tier-2
@@ -1307,17 +1320,13 @@ agents:
     name: "senior_consultant_human"
     agent_type: "human"
     description: "Senior consultant — strategic accounts, recommendation deliverables"
-    human_interface: "webhook"
+    human_interface: "default"   # the Inbox (no vault connection needed)
     communication_type: "dual"
     human_timeout_seconds: 21600         # 6 hours
     fallback_on_timeout: true
     fallback_response:
       human_decision: "held"
       human_message: "held_for_review"
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
 
     yields:
       human_message: "string"            # approved_for_lead | escalate_to_lead | escalate | held_for_review
@@ -1326,15 +1335,25 @@ agents:
     inputs:
       deliverable_id: "string"
 
+    # Nothing advances on silence (6 h, then the Inbox card closes and the
+    # ticket records that no reply came; nobody is chased automatically).
+    human_prompt_template: |
+      Recommendation / strategic-account draft for your editing pass. When
+      done, reply with exactly one word:
+        approved_for_lead  — your edited draft goes to the engagement lead
+        escalate_to_lead   — the lead needs to decide something first
+        escalate           — the coordinator routes it to the partner
+      Any other reply is recorded and the draft does not move.
+
     can_call:
       # Edited draft or escalation → the coordinator relays to the lead.
       # human(dual)→coordinator(chain): no human→human wire.
       - agent: "engagement_coordinator_agent"
         condition: "calling_agent_response.human_message == 'approved_for_lead' or calling_agent_response.human_message == 'escalate_to_lead' or calling_agent_response.human_message == 'escalate'"
 
-      # Default-deny terminus.
+      # Anything else (incl. the held_for_review fallback) → recorded.
       - agent: "delivery_audit_logger_agent"
-        condition: "calling_agent_response.human_message == 'held_for_review'"
+        condition: "calling_agent_response.human_message != 'approved_for_lead' and calling_agent_response.human_message != 'escalate_to_lead' and calling_agent_response.human_message != 'escalate'"
 
   # ────────────────────────────────────────────────────────────
   # sme_human — domain SME
@@ -1343,17 +1362,13 @@ agents:
     name: "sme_human"
     agent_type: "human"
     description: "Domain SME — depth-of-expertise on the practice area"
-    human_interface: "webhook"
+    human_interface: "default"   # the Inbox (no vault connection needed)
     communication_type: "dual"
     human_timeout_seconds: 28800         # 8 hours
     fallback_on_timeout: true
     fallback_response:
       human_decision: "held"
       human_message: "held_for_review"
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
 
     yields:
       human_message: "string"            # approved_for_lead | escalate_to_lead | escalate_to_partner | held_for_review
@@ -1363,15 +1378,25 @@ agents:
       deliverable_id: "string"
       practice_area: "string"
 
+    # Nothing advances on silence (8 h, then the Inbox card closes and the
+    # ticket records that no reply came; nobody is chased automatically).
+    human_prompt_template: |
+      A draft needs your subject-matter review (low confidence, a regulated /
+      tax practice area, or a knowledge-base entry). Reply with exactly one word:
+        approved_for_lead    — it goes to the engagement lead
+        escalate_to_lead     — the lead needs to decide something first
+        escalate_to_partner  — the coordinator routes it to the partner
+      Any other reply is recorded and the draft does not move.
+
     can_call:
       # Reviewed / escalated → the coordinator relays to lead or partner.
       # human(dual)→coordinator(chain): no human→human wire.
       - agent: "engagement_coordinator_agent"
         condition: "calling_agent_response.human_message == 'approved_for_lead' or calling_agent_response.human_message == 'escalate_to_lead' or calling_agent_response.human_message == 'escalate_to_partner'"
 
-      # Default-deny terminus.
+      # Anything else (incl. the held_for_review fallback) → recorded.
       - agent: "delivery_audit_logger_agent"
-        condition: "calling_agent_response.human_message == 'held_for_review'"
+        condition: "calling_agent_response.human_message != 'approved_for_lead' and calling_agent_response.human_message != 'escalate_to_lead' and calling_agent_response.human_message != 'escalate_to_partner'"
 
   # ────────────────────────────────────────────────────────────
   # engagement_lead_human — PM + relationship owner (ALWAYS in loop)
@@ -1380,19 +1405,18 @@ agents:
     name: "engagement_lead_human"
     agent_type: "human"
     description: "Engagement lead / PM — owns the relationship; ALWAYS reviews before client sees output"
-    human_interface: "webhook"
+    human_interface: "default"   # the Inbox (no vault connection needed)
     communication_type: "dual"
     human_timeout_seconds: 21600         # 6 hours
-    # DEFAULT-DENY: an unanswered final review holds the deliverable for manual
-    # review and records it — silence never ships a deliverable to a client.
+    # Silence never ships a deliverable to a client. If nobody answers within
+    # 6 h, the request waits no longer: its Inbox card closes and the ticket
+    # records that no reply came; nobody is chased automatically. The
+    # fallback below (held_for_review → audit) is the declared intent; on SDK
+    # 2.4.486 a dual seat does not route it.
     fallback_on_timeout: true
     fallback_response:
       human_decision: "held"
       human_message: "held_for_review"
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
 
     yields:
       human_message: "string"            # approved_for_client | needs_rework | hold_for_review | escalate | held_for_review
@@ -1404,7 +1428,11 @@ agents:
 
     human_prompt_template: |
       Final review BEFORE the client sees this. Take your time —
-      reputation matters more than throughput.
+      reputation matters more than throughput. Reply with exactly one word:
+        approved_for_client  — the deliverable is compiled for the client
+        needs_rework         — recorded; nothing is compiled
+        escalate             — the coordinator routes it to the partner
+      Any other reply is recorded and nothing is compiled.
 
     can_call:
       # ── APPROVE → the deliverable_assembler (FINISHER) COMPILES the real
@@ -1422,7 +1450,7 @@ agents:
       # Not-approved verdicts (rework / hold / default-deny) terminate straight
       # to the WORM audit — nothing is compiled.
       - agent: "delivery_audit_logger_agent"
-        condition: "calling_agent_response.human_message == 'needs_rework' or calling_agent_response.human_message == 'hold_for_review' or calling_agent_response.human_message == 'held_for_review'"
+        condition: "calling_agent_response.human_message != 'approved_for_client' and calling_agent_response.human_message != 'escalate'"
 
   # ────────────────────────────────────────────────────────────
   # partner_human — escalation tier
@@ -1431,18 +1459,16 @@ agents:
     name: "partner_human"
     agent_type: "human"
     description: "Partner — exec sponsor, escalation tier"
-    human_interface: "webhook"
+    human_interface: "default"   # the Inbox (no vault connection needed)
     communication_type: "dual"
     human_timeout_seconds: 43200         # 12 hours
-    # DEFAULT-DENY: an unreachable partner holds the engagement and records it.
+    # Nothing advances on silence. If nobody answers within 12 h, the Inbox
+    # card closes and the ticket records that no reply came. The fallback
+    # below is the declared intent; on SDK 2.4.486 a dual seat does not route it.
     fallback_on_timeout: true
     fallback_response:
       human_decision: "held"
       human_message: "held_for_review"
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
 
     yields:
       human_message: "string"            # directive_issued | halt_for_review | held_for_review
@@ -1514,7 +1540,7 @@ agents:
     agent_type: "external"
     description: "Hash-chained WORM audit of every QA outcome, edit, approval, escalation"
     framework: "custom"
-    communication_type: "execute"
+    communication_type: "chain"
 
     connector_config:
       sink_type: "local_file"
@@ -1590,10 +1616,10 @@ agents:
 
     yields:
       client_facing_summary: "string"
-      this_week_accomplishments: "list"
-      blockers_for_client: "list"
-      next_week_plan: "list"
-      open_questions: "list"
+      this_week_accomplishments: {type: array, items: object}
+      blockers_for_client: {type: array, items: string}
+      next_week_plan: {type: array, items: string}
+      open_questions: {type: array, items: object}
       confidence_in_timeline: "number"
       tone_used: "string"
 
@@ -1624,9 +1650,15 @@ agents:
       # carry {engagement_id, consultant_id, activity, hours, billable,
       # date, rate_cents}; report payloads carry {engagement_id}.
       # The workflow returns the aggregate fields declared in yields.
-      # Env fallback: N8N_WEBHOOK_URL.
-      webhook_url: "${PSA_TIMESHEET_WEBHOOK_URL:}"
-      auth_token: "${PSA_TIMESHEET_AUTH_TOKEN:}"
+      # Day 0 the record does not exist yet. Its address +
+      # token live only in the vault: create the vault connection
+      # 'psa_timesheet_n8n' on Infrastructure → Integrations → n8n (or an
+      # "Add custom" record, service type Tools — base URL = the workflow's
+      # webhook URL, token = its auth token), until it exists the SDK
+      # switches this agent off with a notice (it is never called without
+      # an address); it switches on, with no restart, once the record
+      # exists.
+      connection: psa_timesheet_n8n
       timeout: 60
     # wake_up: "0 8 * * 1"             # weekly hours pull — enable after wiring your PSA/timesheet connector
 
@@ -1744,12 +1776,12 @@ agents:
       time_briefing: "string"
       budget_utilisation: "number"        # echoed from the PSA connector
       over_budget: "boolean"              # echoed from the PSA connector
-      scope_drift_items: "list"
-      change_order_candidates: "list"
+      scope_drift_items: {type: array, items: object}
+      change_order_candidates: {type: array, items: object}
       severity_score: "number"           # RE-COMPUTED by control_floor (@chain)
       requires_lead_action: "boolean"     # FORCED true by control_floor on any tripped control
       scope_briefing: "string"
-      control_trips: "list"               # control_floor (@chain) — named controls that fired
+      control_trips: {type: array, items: string}               # control_floor (@chain) — named controls that fired
 
     inputs:
       upstream_yields: "object"
@@ -1841,7 +1873,7 @@ agents:
       utilisation_pct: "number"
       composite_score: "number"
       rating: "string"
-      client_quotes: "list"
+      client_quotes: {type: array, items: string}
       requires_calibration: "boolean"
       requires_partner_review: "boolean"
       requires_pip: "boolean"
@@ -1930,7 +1962,7 @@ agents:
 
     yields:
       engagement_id: "string"
-      entries: "list"
+      entries: {type: array, items: object}
       kb_entries_count: "number"
       high_reusability_count: "number"
       skipped_client_specific: "number"

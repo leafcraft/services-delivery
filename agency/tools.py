@@ -10,13 +10,15 @@ connector wired, and **each announces itself**: when there is no real source
 and no seed, it returns `available: false` and says why — never a synthetic
 success that looks like a real read (see building-agents-thoroughly A4/A5).
 
-To go live, wire the KB/RAG `mcp:` block in config.yaml (research) and swap the
+To go live, create the vault record 'kb_mcp' (Infrastructure → Integrations →
+MCP), uncomment the KB/RAG `mcp:` block in config.yaml (research) and swap the
 store's `claim_next_active_engagement` body for your PSA query + atomic claim.
 Registered by `import agency.tools` in main.py BEFORE `from_yaml()`/`start()`.
 """
 import os
 
-from leafmesh import global_tool, LeafMeshLogger
+from leafmesh import global_tool, LeafMeshLogger, connection_rows
+from leafmesh.vault.refs import UnresolvedVaultRef
 
 try:
     from ._shared import store
@@ -28,13 +30,24 @@ except ImportError:  # pragma: no cover — direct-run fallback
 logger = LeafMeshLogger(__name__)
 
 
-def _kb_wired() -> bool:
-    """True if a real KB/RAG connector is configured (KB mcp URL set)."""
-    return bool(os.getenv("KB_MCP_URL"))
+KB_RECORD = "kb_mcp"
+
+
+async def _kb_wired() -> bool:
+    """True when the vault record the KB/RAG mcp block uses exists. Never
+    read from .env. UnresolvedVaultRef = no such record = not wired; any
+    other error means the record exists (not ours to read as rows)."""
+    try:
+        await connection_rows(KB_RECORD)
+        return True
+    except UnresolvedVaultRef:
+        return False
+    except PermissionError:  # SecretNotAllowed: the record exists; it only limits which agents read it
+        return True
 
 
 @global_tool(category="research")
-def search_prior_art(engagement_id: str = "", practice_area: str = "") -> dict:
+async def search_prior_art(engagement_id: str = "", practice_area: str = "") -> dict:
     """Search prior art (past projects, industry reports, methodology) relevant
     to an engagement's practice area, for grounding research findings.
 
@@ -47,9 +60,9 @@ def search_prior_art(engagement_id: str = "", practice_area: str = "") -> dict:
         practice_area: Optional explicit practice area (overrides the brief's).
     """
     result = store.search_prior_art(str(engagement_id).strip(), str(practice_area).strip())
-    if not result.get("available") and _kb_wired():
+    if not result.get("available") and await _kb_wired():
         return {"available": False,
-                "reason": "KB connector wired but returned nothing for this query"}
+                "reason": "KB is wired — use the kb_* MCP tools for this query"}
     logger.info(f"search_prior_art eng={engagement_id} available={result.get('available')}")
     return result
 
