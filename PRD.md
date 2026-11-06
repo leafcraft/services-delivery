@@ -59,7 +59,7 @@ log_time_entry / scope_creep_check ─► timesheet_connector_agent (n8n/PSA)
                                             ├─► engagement_lead_human (action)
                                             └─► delivery_audit_logger_agent (clean)
 
-weekly_sync (cron, tz) ─► status_sweep_orchestrator_agent (instances:3, atomic claim)
+weekly_sync (cron, tz) ─► status_sweep_orchestrator_agent (copies.count:3, atomic claim)
                           ├─► engagement_lead_human (blocked/overdue)
                           └─► delivery_audit_logger_agent (clean)
 draft_client_status / daily_standup_brief / monthly_steering_pack
@@ -83,7 +83,7 @@ escalation_received ─► partner_human (direct)
 | `deliverable_assembler_agent` | Deliverable assembler (finisher) | programmatic (fail-closed render to ./out) |
 | `engagement_controller_agent` | Engagement controller | llm (KB: engagement_sow_library) |
 | `timesheet_connector_agent` | Timesheet/PSA liaison | programmatic (n8n) |
-| `status_sweep_orchestrator_agent` | Delivery PMO coordinator | llm (`instances:3` + atomic claim; live cron+tz) |
+| `status_sweep_orchestrator_agent` | Delivery PMO coordinator | llm (`scaling.copies.count: 3` + atomic claim; live cron+tz) |
 | `engagement_status_drafter_agent` | Client communications drafter | llm (cron; KB: client_context) |
 | `performance_review_agent` | People-ops review drafter | llm (KB: consultant_review_rubric) |
 | `doc_extraction_agent` | Knowledge manager | llm (KB: kb_taxonomy) |
@@ -117,7 +117,7 @@ escalation_received ─► partner_human (direct)
 - **research_agent ↔ context_agent** — peers. `context_agent` may bounce
   to `research_agent` when `confidence < 0.6`, bounded to one bounce per
   session by the Python loop guard (`context_retry_exhausted`).
-- **consultant_agent** — Claude Sonnet, `thinking_budget: 8192`. One
+- **consultant_agent** — Claude Sonnet, `reasoning_budget: 8192`. One
   role: analyse + draft. **Self-reliant**: `@pre_compose`
   (`load_engagement_context`) pulls its OWN brief + research corpus +
   client account + prior deliverables from the dev store (PROD:
@@ -162,7 +162,7 @@ ad-hoc/debug invocation.
 ## Controls & trust
 
 - **Never auto-deliver** — engagement_lead_human always reviews
-  (`condition: "true"`); default-deny `hold_for_review` on timeout.
+  (`condition: "true"`); nothing is compiled without `approved_for_client`.
 - **PII → partner** — `pii_concerns != []` routes to partner_human; the
   sme/senior/associate wires all carry `pii_concerns == []`.
 - **Citation-or-nothing** — uncited claims auto-reject at QA; coverage
@@ -176,16 +176,19 @@ ad-hoc/debug invocation.
 - **No human→human wire** — humans are first-class but never call each
   other; the IC tiers hand back to `engagement_coordinator_agent` (dual→chain),
   which routes on (chain→dual); `dual` lives only on the human boundary.
-- **HITL default-deny** — every gate `fallback_on_timeout` → `held_for_review`
-  → the WORM sink; the Manager supervisor carries human→human escalation.
+- **Nothing advances on silence** — an unanswered gate closes its Inbox card
+  and the ticket records that no reply came; nobody is chased
+  automatically (the declared `fallback_response` → `held_for_review` is
+  kept; on SDK 2.4.486 a dual seat does not route it). The Manager
+  escalates only agent errors to the partner.
 
 ## Config pointer
 
-The department is `configs/config.yaml`. State of record lives in your
+The department is the agency's configuration. State of record lives in your
 systems: hours in the PSA/timesheet system behind
 `timesheet_connector_agent` (n8n; cron commented until wired). The weekly
 sweep (`status_sweep_orchestrator_agent`) runs day-0 on its live cron —
-`instances:3` copies each atomically claim one engagement from the seed
+`scaling.copies.count: 3` copies each atomically claim one engagement from the seed
 backlog via `agency/tools.py`; wiring tier 3 swaps the claim tool's body
 for your PSA query. The full chain runs day-0 on Tier 1 alone against a
 seeded dev store (`agency/_shared/store.py`) — a brief, research corpus,
@@ -215,7 +218,6 @@ other floor is a prompt contract + `enforce_yields`.
 - **time ledger removed from the template** — billable hours belong in
   the firm's PSA; `engagement_controller_agent` is the judgment on top of
   PSA numbers, never the ledger.
-- **Slack delivery** — the escalation `channel` target uses
-  `channel_id` + `message_template` only; `SLACK_BOT_TOKEN` /
-  `SLACK_SIGNING_SECRET` are ChannelConfig fields and need a `channels:`
-  block to actually send (documented in `env`, not yet wired).
+- **Slack delivery** — the escalation `channel` target ships commented: to
+  send it needs Slack connected in the vault and `partner_human` given a
+  `channels: {slack: {connection: <name>}}` block (documented in `env`).
