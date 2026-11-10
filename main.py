@@ -6,13 +6,13 @@ import sys
 from dotenv import load_dotenv
 from leafmesh import EventType, LeafMesh, LeafMeshLogger
 
-import agency.tools  # noqa: F401 — registers @global_tool tools BEFORE from_yaml/start()
+import agency.tools  # noqa: F401 — registers @global_tool tools BEFORE from_store/start()
 from agency._shared import audit_logger as _audit_logger
 
 load_dotenv()
 logger = LeafMeshLogger(__name__)
 
-leafmesh = LeafMesh.from_yaml("configs/config.yaml")
+leafmesh = LeafMesh.from_store()
 
 # Register the WORM audit sink as the intelligence function for the
 # custom external delivery_audit_logger_agent (SDK 2.4+ API).
@@ -40,11 +40,8 @@ async def main():
     leafmesh.event_bus.subscribe(EventType.INTERVENTION_NEEDED,   _on_intervention_needed)
     leafmesh.event_bus.subscribe(EventType.HUMAN_INPUT_TIMEOUT,   _on_human_input_timeout)
 
-    try:
-        await leafmesh.enable_self_healing()
-        logger.info("Self-healing enabled")
-    except AttributeError:
-        pass
+    # Self-healing is automatic — the SDK enables it during start() on
+    # every operator-facing mesh. No call is needed.
 
     logger.info("services-delivery — Services Delivery mesh running")
     logger.info("API docs: http://127.0.0.1:18820/docs")

@@ -14,7 +14,7 @@ floor that runs AFTER the model, not in the prompt:
   3. STAKES→TIER DERIVATION — `review_tier` (associate / senior / sme /
      partner) is computed in Python from the stakes (PII, practice area,
      deliverable type, strategic account, confidence). The visible
-     can_call wires in config.yaml route on the SAME fields; this floor
+     can_call wires in the configuration route on the SAME fields; this floor
      guarantees the fields are correct before they are read.
 
 @pre_compose  pull_engagement_record — recover the engagement/deliverable
