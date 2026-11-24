@@ -174,12 +174,13 @@ ad-hoc/debug invocation.
   approval by allow/deny token (fail-closed on unknown) + QA, renders the
   real document, deletes any partial on a block.
 - **No human→human wire** — humans are first-class but never call each
-  other; the IC tiers hand back to `engagement_coordinator_agent` (dual→chain),
-  which routes on (chain→dual); `dual` lives only on the human boundary.
-- **Nothing advances on silence** — an unanswered gate closes its Inbox card
-  and the ticket records that no reply came; nobody is chased
-  automatically (the declared `fallback_response` → `held_for_review` is
-  kept; on SDK 2.4.486 a dual seat does not route it). The Manager
+  other; the IC tiers hand back to `engagement_coordinator_agent`, which
+  routes on. Every seat is `chain` with a `reply_reader` (`gpt-4o-mini`) that
+  turns the typed reply into a `verdict`; `answer` goes back to only the
+  agent that asked.
+- **Nothing advances on silence** — an unanswered question to a person's `fallback_response`
+  (`verdict: hold`, `held_for_review`) goes through its routes like any reply
+  and lands in the WORM audit; nobody is chased automatically. The Manager
   escalates only agent errors to the partner.
 
 ## Config pointer

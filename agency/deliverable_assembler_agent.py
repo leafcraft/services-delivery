@@ -12,7 +12,7 @@ The compile is FAIL-CLOSED. A deliverable is only ever written when BOTH
 of these hold (enforced in the @chain floor the LLM/human cannot waive):
 
   1. The engagement lead APPROVED it for the client
-     (human_message == 'approved_for_client'), and
+     (verdict == 'approved_for_client'), and
   2. QA passed — no uncited claims, no unresolved citations, no
      contradictions, no PII concerns.
 
@@ -21,7 +21,7 @@ blocked: no file is produced and the agent returns a blocked status with
 the reasons. This is the completeness floor for the whole template — it
 turns draft-and-route into a team that ships.
 
-@pre_compose  recover_approved_deliverable — after the HITL gate the SDK
+@pre_compose  recover_approved_deliverable — after the human step the SDK
               re-delivers only the human-response meta, so this pulls the
               approved deliverable context (sections, citations,
               deliverable_id, engagement metadata) back from the per-
@@ -88,12 +88,13 @@ def _slug(text: str) -> str:
 
 
 def _human_message(input_data: dict[str, Any], context: dict[str, Any]) -> str:
-    """The engagement lead's verdict. After a HITL gate the verdict arrives
-    as human_message (top-level or under original_webhook_data)."""
+    """The engagement lead's verdict. Since 2.4.528 the seat's reply_reader
+    puts it in `verdict`; otherwise it is human_message (top-level or under
+    original_webhook_data)."""
     for src in (input_data, context):
         if not isinstance(src, dict):
             continue
-        msg = src.get("human_message")
+        msg = src.get("verdict") or src.get("human_message")
         if msg:
             return str(msg).strip().lower()
         owd = src.get("original_webhook_data")
@@ -102,7 +103,7 @@ def _human_message(input_data: dict[str, Any], context: dict[str, Any]) -> str:
     return ""
 
 
-# ── @pre_compose: recover the approved deliverable after the HITL gate ──
+# ── @pre_compose: recover the approved deliverable after the human step ──
 def recover_approved_deliverable(data: Any, ctx: Any) -> dict[str, Any]:
     """The lead approves in the Studio inbox; the SDK then resumes the
     chain with only the human-response meta — the deliverable that flowed

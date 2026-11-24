@@ -1,6 +1,6 @@
 """qa_agent — deterministic QA floor + tier derivation + pre-gate stash.
 
-This is the last agent before the human gates, and it carries three
+This is the last agent before the human steps, and it carries three
 things the LLM must NOT be able to waive — so they live in a `@chain`
 floor that runs AFTER the model, not in the prompt:
 
@@ -55,7 +55,7 @@ _PII_PATTERNS = (
     ("phone", re.compile(r"(?<!\d)(?:\+?\d[\d\-\s().]{8,}\d)(?!\d)")),
 )
 
-# Engagement + deliverable context worth recovering after a human gate.
+# Engagement + deliverable context worth recovering after a human step.
 _STASH_KEYS = (
     "engagement_id", "client_id", "practice_area", "deliverable_type",
     "scope_summary", "deadline_utc", "strategic_account",
